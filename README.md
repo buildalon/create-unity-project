@@ -24,7 +24,7 @@ A GitHub Action to create a new Unity Project using a predefined template packag
 
 ```yaml
 steps:
-  - uses: /create-unity-project@v1
+  - uses: buildalon/create-unity-project@v1
     with:
       project-name: Test Project
       project-directory: ./Unity Project
