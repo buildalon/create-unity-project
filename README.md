@@ -9,14 +9,14 @@ A GitHub Action to create a new Unity Project using a predefined template packag
 > [!IMPORTANT]
 > This action requires that the Unity Editor is installed on the runner.
 >
-> You can use [`unity-setup`](https://github.com//unity-setup) action to install Unity Editor before using this action.
+> You can use [`unity-setup`](https://github.com/buildalon/unity-setup) action to install Unity Editor before using this action.
 
 - `UNITY_EDITOR_PATH` environment variable must be set to the path of the Unity Editor executable.
 
 > [!IMPORTANT]
 > This action requires an active Unity license be available on the runner.
 >
-> You can use [`activate-unity-license`](https://github.com//activate-unity-license) action to activate the Unity license before using this action.
+> You can use [`activate-unity-license`](https://github.com/buildalon/activate-unity-license) action to activate the Unity license before using this action.
 
 - A license activation for the Unity Editor must also be completed before using this action.
 
