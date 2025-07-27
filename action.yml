@@ -1,0 +1,36 @@
+name: Buildalon create unity project from hub template
+branding:
+  icon: cloud-lightning
+  color: red
+description: A GitHub Action to create a new Unity Project using a predefined template package.
+inputs:
+  project-name:
+    description: The name of the Unity project to create.
+    required: true
+  project-directory:
+    description: The directory where the Unity project will be created. Defaults to the root of the workspace.
+    required: false
+    default: '${{ github.workspace }}'
+  template-name:
+    description: The name of the template package to use for creating the Unity project.
+    required: false
+    default: 'com.unity.template.3d(-cross-platform)?'
+outputs:
+  project-path:
+    description: The path to the created Unity project.
+    value: '${{ inputs.project-directory }}/${{ inputs.project-name }}'
+runs:
+  using: composite
+  steps:
+    - name: Get Unity Template
+      id: template
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TEMPLATE_NAME: ${{ inputs.template-name }}
+      run: '"${ACTION_PATH}/get-unity-template.sh" "${TEMPLATE_NAME}"'
+    - uses: buildalon/unity-action@v2
+      name: Create Unity Project
+      with:
+        log-name: create-unity-project
+        args: '-quit -nographics -batchmode -createProject "${{ inputs.project-directory }}/${{ inputs.project-name }}" -cloneFromTemplate "${{ steps.template.outputs.template-path }}"'
