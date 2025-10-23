@@ -1,0 +1,36 @@
+{
+  "name": "create-unity-project",
+  "version": "2.0.0",
+  "description": "A GitHub Action to create a new Unity Project using a predefined template package.",
+  "author": "buildalon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buildalon/create-unity-project.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/buildalon/create-unity-project/issues"
+  },
+  "homepage": "https://github.com/buildalon/create-unity-project",
+  "keywords": [
+    "unity",
+    "github",
+    "action"
+  ],
+  "main": "dist/index.js",
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@rage-against-the-pixel/unity-cli": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.12",
+    "@vercel/ncc": "^0.34.0",
+    "shx": "^0.3.4",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "npm run clean && npm run bundle",
+    "bundle": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
+    "clean": "npm install && shx rm -rf dist/ out/ node_modules/ && npm ci"
+  }
+}

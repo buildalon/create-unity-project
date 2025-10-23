@@ -18,19 +18,6 @@ inputs:
 outputs:
   project-path:
     description: The path to the created Unity project.
-    value: '${{ inputs.project-directory }}/${{ inputs.project-name }}'
 runs:
-  using: composite
-  steps:
-    - name: Get Unity Template
-      id: template
-      shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-        TEMPLATE_NAME: ${{ inputs.template-name }}
-      run: '"${ACTION_PATH}/get-unity-template.sh" "${TEMPLATE_NAME}"'
-    - uses: buildalon/unity-action@v2
-      name: Create Unity Project
-      with:
-        log-name: create-unity-project
-        args: '-quit -nographics -batchmode -createProject "${{ inputs.project-directory }}/${{ inputs.project-name }}" -cloneFromTemplate "${{ steps.template.outputs.template-path }}"'
+  using: 'node20'
+  main: 'dist/index.js'
