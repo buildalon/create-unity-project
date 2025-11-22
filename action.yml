@@ -19,5 +19,5 @@ outputs:
   project-path:
     description: The path to the created Unity project.
 runs:
-  using: 'node20'
-  main: 'dist/index.js'
+  using: node24
+  main: dist/index.js
