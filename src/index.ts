@@ -1,5 +1,5 @@
-import path = require('path');
-import core = require('@actions/core');
+import * as path from 'path';
+import * as core from '@actions/core';
 import { UnityEditor } from '@rage-against-the-pixel/unity-cli';
 
 async function main() {
@@ -46,8 +46,8 @@ async function main() {
 
         await unityEditor.Run({ args: [...args] });
         core.setOutput('project-path', projectPath);
-    } catch (error) {
-        core.setFailed(error);
+    } catch (error: any) {
+        core.setFailed(error instanceof Error ? error.message : String(error));
     }
 }
 
