@@ -4433,6 +4433,7 @@ exports.buildUnitTestJobSummaryMarkdown = buildUnitTestJobSummaryMarkdown;
 exports.truncateStringToUtf8ByteLength = truncateStringToUtf8ByteLength;
 exports.stripSummaryNoiseFromLogMessage = stripSummaryNoiseFromLogMessage;
 const utp_1 = __nccwpck_require__(6282);
+const utp_benign_1 = __nccwpck_require__(6239);
 const github_actions_ci_1 = __nccwpck_require__(9644);
 const logger_provider_1 = __nccwpck_require__(2416);
 /** Severity order for display: Error first, then Warning, then Info. Undefined treats as Warning. */
@@ -4815,18 +4816,31 @@ function formatDurationMsForSummary(ms) {
     return `${(ms / 1000).toFixed(1)}s`;
 }
 /** Unity/CI noise shown in logs; omit from workflow summary foldouts and counts. */
-const SUMMARY_NOISE_ACCESS_TOKEN = 'Access token is unavailable; failed to update';
+function buildSummaryNoisePatterns() {
+    return utp_benign_1.UTP_BENIGN_SEVERITY_REMAPS.map(({ fragment }) => {
+        const escaped = fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Multicast lines often include "(err: 10013)." — strip the whole clause.
+        if (fragment.includes('multicast group')) {
+            return new RegExp(`${escaped}(?:\\s*\\(err:\\s*\\d+\\))?\\.?`, 'gi');
+        }
+        return new RegExp(escaped, 'gi');
+    });
+}
+const SUMMARY_NOISE_PATTERNS = buildSummaryNoisePatterns();
 /**
  * Removes known noise phrases from a log message for summary display.
- * Exported for unit tests.
+ * Exported for unit tests. Fragments come from {@link UTP_BENIGN_SEVERITY_REMAPS}.
  */
 function stripSummaryNoiseFromLogMessage(message) {
     const flat = toSingleLineText(message);
     if (!flat)
         return '';
-    const pattern = SUMMARY_NOISE_ACCESS_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const out = flat.replace(new RegExp(pattern, 'gi'), ' ').replace(/\s+/g, ' ').trim();
-    return out;
+    let out = flat;
+    for (const pattern of SUMMARY_NOISE_PATTERNS) {
+        pattern.lastIndex = 0;
+        out = out.replace(pattern, ' ');
+    }
+    return out.replace(/\s+/g, ' ').trim();
 }
 function filterNoiseFromSummaryLogEntries(entries) {
     const out = [];
@@ -5881,12 +5895,13 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UnityHub = void 0;
+exports.UnityHub = exports.LINUX_HUB_EXECUTABLE_LEGACY = exports.LINUX_HUB_EXECUTABLE_MODERN = void 0;
+exports.resolveLinuxHubExecutable = resolveLinuxHubExecutable;
 const fs = __importStar(__nccwpck_require__(7147));
 const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
 const yaml = __importStar(__nccwpck_require__(4083));
-const asar = __importStar(__nccwpck_require__(5560));
+const asar = __importStar(__nccwpck_require__(9852));
 const child_process_1 = __nccwpck_require__(2081);
 const logging_1 = __nccwpck_require__(4486);
 const unity_editor_1 = __nccwpck_require__(8944);
@@ -5898,44 +5913,101 @@ const unity_releases_api_1 = __nccwpck_require__(7278);
 const MIN_NATIVE_WINDOWS_ARM64_HUB_VERSION = (0, semver_1.coerce)('3.17.0');
 /** Allowed characters in a Debian package version (no shell metacharacters). */
 const LINUX_HUB_DEB_VERSION_RE = /^[0-9A-Za-z.+~:-]+$/;
+/** Hub 3.20+ Electron Forge deb layout. */
+exports.LINUX_HUB_EXECUTABLE_MODERN = '/usr/lib/unityhub/unityhub';
+/** Hub ≤3.19 fpm / electron-builder layout. */
+exports.LINUX_HUB_EXECUTABLE_LEGACY = '/opt/unityhub/unityhub';
+/**
+ * Resolves the Unity Hub binary on Linux.
+ * Prefers UNITY_HUB_PATH, then the Hub 3.20+ path, then the legacy /opt path.
+ * When neither is present (pre-install), defaults to the modern path.
+ */
+function resolveLinuxHubExecutable(envPath = process.env.UNITY_HUB_PATH, existsSync = fs.existsSync) {
+    if (envPath !== undefined && envPath.length > 0) {
+        return envPath;
+    }
+    if (existsSync(exports.LINUX_HUB_EXECUTABLE_MODERN)) {
+        return exports.LINUX_HUB_EXECUTABLE_MODERN;
+    }
+    if (existsSync(exports.LINUX_HUB_EXECUTABLE_LEGACY)) {
+        return exports.LINUX_HUB_EXECUTABLE_LEGACY;
+    }
+    return exports.LINUX_HUB_EXECUTABLE_MODERN;
+}
 /**
  * Fixed bootstrap for Linux Hub apt repo + update index. No user-controlled interpolation (CodeQL).
- * Matches prior `Install` update path (wget | gpg | sudo tee, then sources.list).
+ * Uses DEB822 .sources (Hub 3.20+) and removes legacy .list to avoid duplicate-source warnings.
  */
 const LINUX_HUB_LINUX_UPDATE_REPO_BOOTSTRAP = `#!/bin/sh
 set -e
 wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
+sudo rm -f /etc/apt/sources.list.d/unityhub.list
+sudo tee /etc/apt/sources.list.d/unityhub.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://hub.unity3d.com/linux/repos/deb
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/Unity_Technologies_ApS.gpg
+EOF
 sudo apt-get update --allow-releaseinfo-change
 `;
 /**
  * First phase of fresh Linux Hub install: machine-id, repo keys, jammy mirror, apt-get update.
- * No user-controlled interpolation.
+ * No user-controlled interpolation. Uses DEB822 .sources (Hub 3.20+).
  */
 const LINUX_HUB_LINUX_INSTALL_BOOTSTRAP = `#!/bin/sh
 set -e
 dbus-uuidgen >/etc/machine-id && mkdir -p /var/lib/dbus/ && ln -sf /etc/machine-id /var/lib/dbus/machine-id
 wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list
+rm -f /etc/apt/sources.list.d/unityhub.list
+tee /etc/apt/sources.list.d/unityhub.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://hub.unity3d.com/linux/repos/deb
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/Unity_Technologies_ApS.gpg
+EOF
 echo "deb https://archive.ubuntu.com/ubuntu jammy main universe" | tee /etc/apt/sources.list.d/jammy.list
 apt-get update
 `;
 /**
  * Post-install cleanup and xvfb / unity-hub wrapper setup. Runs as root; no user interpolation.
+ * Wrapper resolves Hub 3.20+ (/usr/lib/unityhub) vs legacy (/opt/unityhub) at runtime so apt
+ * upgrades that move the binary do not leave a stale path (exit 127).
  */
 const LINUX_HUB_LINUX_INSTALL_POST = `#!/bin/sh
 set -e
 apt-get clean
 sed -i 's/^\\(.*DISPLAY=:.*XAUTHORITY=.*\\)\\( "\\$@" \\)2>&1$/\\1\\2/' /usr/bin/xvfb-run
-printf '#!/bin/bash\\nxvfb-run --auto-servernum /opt/unityhub/unityhub "$@" 2>/dev/null' | tee /usr/bin/unity-hub >/dev/null
-chmod 777 /usr/bin/unity-hub
-which unityhub || { echo "Unity Hub installation failed"; exit 1; }
-hubPath=$(which unityhub)
-if [ -z "$hubPath" ]; then
-    echo "Failed to install Unity Hub"
-    exit 1
+command -v unityhub >/dev/null || { echo "Unity Hub installation failed"; exit 1; }
+hubPath=$(readlink -f "$(command -v unityhub)" 2>/dev/null || true)
+if [ -z "$hubPath" ] || [ ! -x "$hubPath" ]; then
+    if [ -x /usr/lib/unityhub/unityhub ]; then
+        hubPath=/usr/lib/unityhub/unityhub
+    elif [ -x /opt/unityhub/unityhub ]; then
+        hubPath=/opt/unityhub/unityhub
+    else
+        echo "Failed to install Unity Hub"
+        exit 1
+    fi
 fi
-chmod -R 777 "$hubPath"
+tee /usr/bin/unity-hub >/dev/null <<'WRAPPER'
+#!/bin/bash
+if [ -x /usr/lib/unityhub/unityhub ]; then
+  hubBin=/usr/lib/unityhub/unityhub
+elif [ -x /opt/unityhub/unityhub ]; then
+  hubBin=/opt/unityhub/unityhub
+else
+  hubBin=$(readlink -f "$(command -v unityhub)" 2>/dev/null || true)
+fi
+if [ -z "$hubBin" ] || [ ! -x "$hubBin" ]; then
+  echo "Unity Hub binary not found" >&2
+  exit 127
+fi
+exec xvfb-run --auto-servernum "$hubBin" "$@" 2>/dev/null
+WRAPPER
+chmod 777 /usr/bin/unity-hub
+chmod -R 777 "$(dirname "$hubPath")"
 `;
 const LINUX_HUB_LINUX_APT_EXTRAS = [
     'xvfb',
@@ -5982,13 +6054,17 @@ class UnityHub {
                 this.editorFileExtension = '/Unity.app/Contents/MacOS/Unity';
                 break;
             case 'linux':
-                this.executable = process.env.UNITY_HUB_PATH || '/opt/unityhub/unityhub';
-                this.rootDirectory = path.join(this.executable, '../');
+                this.refreshLinuxHubPaths();
                 this.editorFileExtension = '/Editor/Unity';
                 break;
             default:
                 throw new Error(`Unsupported platform: ${process.platform}`);
         }
+    }
+    /** Re-resolve Linux Hub executable + root after install/upgrade (Hub 3.20 moved under /usr/lib). */
+    refreshLinuxHubPaths() {
+        this.executable = resolveLinuxHubExecutable();
+        this.rootDirectory = path.join(this.executable, '../');
     }
     /**
      * Some Hub builds (notably Windows headless) occasionally exit non-zero after streaming usable
@@ -6348,6 +6424,9 @@ class UnityHub {
                     const linuxExecOpts = { silent: true, showCommand: true };
                     await (0, utilities_1.Exec)('sudo', ['sh', '-c', LINUX_HUB_LINUX_UPDATE_REPO_BOOTSTRAP], linuxExecOpts);
                     await (0, utilities_1.Exec)('sudo', ['apt-get', 'install', '-y', '--no-install-recommends', '--only-upgrade', hubPkg], linuxExecOpts);
+                    // Refresh xvfb wrapper after upgrades that move /opt → /usr/lib (Hub 3.20+).
+                    await (0, utilities_1.Exec)('sudo', ['sh', '-c', LINUX_HUB_LINUX_INSTALL_POST], linuxExecOpts);
+                    this.refreshLinuxHubPaths();
                     this.logger.info(`Unity Hub updated successfully.`);
                 }
                 else {
@@ -6357,6 +6436,9 @@ class UnityHub {
             else {
                 this.logger.info(`Unity Hub is already installed and up to date.`);
             }
+        }
+        if (process.platform === 'linux') {
+            this.refreshLinuxHubPaths();
         }
         await fs.promises.access(this.executable, fs.constants.X_OK);
         return this.executable;
@@ -6480,6 +6562,7 @@ class UnityHub {
                 await (0, utilities_1.Exec)('sudo', ['sh', '-c', LINUX_HUB_LINUX_INSTALL_BOOTSTRAP], linuxExecOpts);
                 await (0, utilities_1.Exec)('sudo', ['apt-get', 'install', '-y', '--no-install-recommends', hubPkg, ...LINUX_HUB_LINUX_APT_EXTRAS], linuxExecOpts);
                 await (0, utilities_1.Exec)('sudo', ['sh', '-c', LINUX_HUB_LINUX_INSTALL_POST], linuxExecOpts);
+                this.refreshLinuxHubPaths();
                 break;
             }
             default:
@@ -6586,26 +6669,42 @@ class UnityHub {
         this.logger.ci(`Getting release info for Unity ${unityVersion.toString()}...`);
         let resolvedVersion = unityVersion;
         if (!resolvedVersion.isLegacy()) {
-            try {
-                if (!resolvedVersion.isFullyQualified()) {
+            // Hub list is a fast path only. Misses must fall through to the Releases API —
+            // do not fail-closed until both Hub match and API resolution have failed.
+            if (!resolvedVersion.isFullyQualified()) {
+                try {
                     const releases = await this.ListAvailableReleases();
                     logging_1.Logger.instance.debug(`Found ${releases.length} available Unity releases, searching channels: ${channels.join(', ')}`);
                     resolvedVersion = resolvedVersion.findMatch(releases, channels);
                 }
-                if (!resolvedVersion?.changeset) {
-                    const unityReleaseInfo = await this.GetEditorReleaseInfo(resolvedVersion);
+                catch (hubMatchError) {
+                    this.logger.debug(`No Hub list match for ${resolvedVersion.toString()} (channels: ${channels.join(', ')}); trying Releases API...\n${hubMatchError}`);
+                }
+            }
+            if (!resolvedVersion.changeset) {
+                try {
+                    const unityReleaseInfo = await this.GetEditorReleaseInfo(resolvedVersion, channels);
                     resolvedVersion = new unity_version_1.UnityVersion(unityReleaseInfo.version, unityReleaseInfo.shortRevision, resolvedVersion.architecture);
                 }
-            }
-            catch (error) {
-                this.logger.warn(`Failed to get Unity release info for ${resolvedVersion.toString()}! falling back to legacy search...\n${error}`);
-                try {
-                    resolvedVersion = await this.fallbackVersionLookup(resolvedVersion);
+                catch (error) {
+                    // Fail closed for partial versions: never Hub-install "6000.6" and hope it picks a beta.
+                    if (!resolvedVersion.isFullyQualified()) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        throw new Error(`Failed to resolve Unity ${unityVersion.toString()} for channel(s) [${channels.join(', ')}]: ${msg}`);
+                    }
+                    this.logger.warn(`Failed to get Unity release info for ${resolvedVersion.toString()}! falling back to legacy search...\n${error}`);
+                    try {
+                        resolvedVersion = await this.fallbackVersionLookup(resolvedVersion);
+                    }
+                    catch (fallbackError) {
+                        this.logger.warn(`Failed to lookup changeset for Unity ${resolvedVersion.toString()}!\n${fallbackError}`);
+                    }
                 }
-                catch (fallbackError) {
-                    this.logger.warn(`Failed to lookup changeset for Unity ${resolvedVersion.toString()}!\n${fallbackError}`);
-                }
             }
+        }
+        if (!resolvedVersion.isLegacy() && !resolvedVersion.isFullyQualified()) {
+            throw new Error(`Refusing to install non-fully-qualified Unity version ${resolvedVersion.toString()} without a resolved release. ` +
+                `Use a fully-qualified version or --channel matching an available stream.`);
         }
         const allowPartialMatches = !resolvedVersion.isFullyQualified();
         let editorPath = await this.checkInstalledEditors(resolvedVersion, false, undefined, allowPartialMatches);
@@ -6786,9 +6885,10 @@ done
      * Gets the specified Unity release info from the Unity Releases API.
      * Supports querying by exact version or by prefix (e.g., "2020", "2020.1", "2021.x", "2021.3.x").
      * @param unityVersion The Unity version to get the release info for.
+     * @param channels Letter channels to accept (`f`, `p`, `b`, `a`, `x`). Default stable-only.
      * @returns The Unity release info.
      */
-    async GetEditorReleaseInfo(unityVersion) {
+    async GetEditorReleaseInfo(unityVersion, channels = ['f']) {
         // Prefer querying the releases API with the exact fully-qualified Unity version (e.g., 2022.3.10f1).
         // If we don't have a fully-qualified version, use the most specific prefix available:
         //  - "YYYY.M" when provided (e.g., 6000.1)
@@ -6808,6 +6908,7 @@ done
             }
         }
         const releasesClient = new unity_releases_api_1.UnityReleasesClient();
+        const channelSet = new Set(channels.map(c => c.toLowerCase()));
         function getPlatform() {
             switch (process.platform) {
                 case 'darwin':
@@ -6819,6 +6920,10 @@ done
                 default:
                     throw new Error(`Unsupported platform: ${process.platform}`);
             }
+        }
+        function releaseChannelLetter(releaseVersion) {
+            const m = /^(\d{1,4})\.(\d+)\.(\d+)([abcfpx])(\d+)$/.exec(releaseVersion);
+            return m?.[4];
         }
         const request = {
             url: '/unity/editor/release/v1/releases',
@@ -6839,22 +6944,29 @@ done
             if (!data || !data.results || data.results.length === 0) {
                 throw new Error(`No Unity releases found for version: ${version}`);
             }
-            // Filter to stable 'f' releases only unless the user explicitly asked for a pre-release
-            const isExplicitPrerelease = /[abcpx]$/.test(unityVersion.version) || /[abcpx]/.test(unityVersion.version);
             const releases = (data.results || [])
                 .filter((release) => {
                 const v = release.version;
                 if (v == null || v === '') {
                     return false;
                 }
-                return isExplicitPrerelease || v.includes('f');
+                // Exact FQ request: accept that row regardless of channel filter.
+                if (fullUnityVersionPattern.test(unityVersion.version) && v === unityVersion.version) {
+                    return true;
+                }
+                const letter = releaseChannelLetter(v);
+                return letter != null && channelSet.has(letter);
             })
                 .map(release => ({
                 unityRelease: release,
                 unityVersion: new unity_version_1.UnityVersion(release.version, release.shortRevision, unityVersion.architecture)
             }));
             if (releases.length === 0) {
-                throw new Error(`No suitable Unity releases (stable) found for version: ${version}`);
+                const channelList = [...channelSet].join(',');
+                throw new Error(`No suitable Unity releases (channels: ${channelList}) found for version: ${version}` +
+                    (channelSet.has('f') && channelSet.size === 1
+                        ? `. No stable (f) release for ${version}; use --channel b/a or a fully-qualified version.`
+                        : ''));
             }
             releases.sort((a, b) => unity_version_1.UnityVersion.compare(b.unityVersion, a.unityVersion));
             logging_1.Logger.instance.debug(`Found ${releases.length} matching Unity releases for version: ${version}`);
@@ -7229,6 +7341,7 @@ const path = __importStar(__nccwpck_require__(1017));
 const logging_1 = __nccwpck_require__(4486);
 const utilities_1 = __nccwpck_require__(9746);
 const utp_1 = __nccwpck_require__(6282);
+const utp_benign_1 = __nccwpck_require__(6239);
 // Detects workflow command markers to avoid emitting duplicate annotations
 const annotationCommandPrefixRegex = /\n::[a-z]+::/i;
 // Matches ANSI escape sequences (CSI and single-character)
@@ -8112,24 +8225,6 @@ async function writeUtpTelemetryLog(filePath, entries, logger) {
     }
 }
 /**
- * Editor log messages whose severity has been changed.
- * Useful for making certain error messages that are not critical less noisy.
- * Key is a substring of the log message, value is the remapped LogLevel.
- */
-const remappedEditorLogs = {
-    'OpenCL device, baking cannot use GPU lightmapper.': logging_1.LogLevel.INFO,
-    'Failed to find a suitable OpenCL device, baking cannot use GPU lightmapper.': logging_1.LogLevel.INFO,
-    '~StackAllocator(ALLOC_TEMP_MAIN) m_LastAlloc not NULL. Did you forget to call FreeAllStackAllocations()?': logging_1.LogLevel.INFO,
-};
-function getRemappedEditorLogLevel(message) {
-    for (const [fragment, level] of Object.entries(remappedEditorLogs)) {
-        if (message.includes(fragment)) {
-            return level;
-        }
-    }
-    return undefined;
-}
-/**
  * Tails a log file using fs.watch and ReadStream for efficient reading.
  * @param logPath The path to the log file to tail.
  * @param projectPath The path to the project (used for log annotation).
@@ -8230,13 +8325,7 @@ function TailLogFile(logPath, projectPath) {
                         }
                     }
                 }
-                if (utp.message && 'severity' in utp &&
-                    (utp.severity === utp_1.Severity.Error || utp.severity === utp_1.Severity.Exception || utp.severity === utp_1.Severity.Assert)) {
-                    let messageLevel = logging_1.LogLevel.ERROR;
-                    const remappedLevel = getRemappedEditorLogLevel(utp.message);
-                    if (remappedLevel !== undefined) {
-                        messageLevel = remappedLevel;
-                    }
+                if (utp.message && 'severity' in utp && (0, utp_1.isElevatedUtpSeverity)(utp.severity)) {
                     const normalizedPath = normalizeAnnotationPath(utp.file, projectPath);
                     const stacktrace = sanitizeStackTrace(utp.stackTrace);
                     const message = stacktrace == undefined ? utp.message : `${utp.message}\n${stacktrace}`;
@@ -8254,19 +8343,16 @@ function TailLogFile(logPath, projectPath) {
                             }
                         }
                         else {
-                            switch (messageLevel) {
-                                case logging_1.LogLevel.WARN:
-                                    logger.warn(message);
-                                    break;
-                                case logging_1.LogLevel.ERROR:
-                                    logger.error(message);
-                                    break;
-                                case logging_1.LogLevel.INFO:
-                                default:
-                                    logger.info(message);
-                                    break;
-                            }
+                            logger.error(message);
                         }
+                    }
+                }
+                else if (utp.message && (0, utp_benign_1.utpMessageMatchesBenignRemap)(utp.message)) {
+                    // Remapped at normalize time (e.g. multicast WSAEACCES); surface as info, not error.
+                    const stacktrace = sanitizeStackTrace(utp.stackTrace);
+                    const message = stacktrace == undefined ? utp.message : `${utp.message}\n${stacktrace}`;
+                    if (!annotationCommandPrefixRegex.test(message)) {
+                        logger.info(message);
                     }
                 }
                 else if (logging_1.Logger.instance.logLevel === logging_1.LogLevel.UTP) {
@@ -8278,8 +8364,21 @@ function TailLogFile(logPath, projectPath) {
             }
         }
         else {
+            // Skip plain-log false positives (e.g. "Socket: bind failed, error: …" matching \berror\b).
+            if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(line)) {
+                if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
+                    process.stdout.write(`${line}\n`);
+                }
+                return;
+            }
             const scan = parsePlainLogIssue(line);
             if (scan) {
+                if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message)) {
+                    if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
+                        process.stdout.write(`${line}\n`);
+                    }
+                    return;
+                }
                 const key = buildIssueKey(scan.file, scan.line, scan.message);
                 if (!seenIssueKeys.has(key)) {
                     seenIssueKeys.add(key);
@@ -8589,6 +8688,12 @@ class UnityVersion {
     semVer;
     logger = logging_1.Logger.instance;
     constructor(version, changeset = undefined, architecture = undefined) {
+        // Accept ProjectVersion / matrix style: "5.6.7f1 (e80cc3114ac1)" (no regex: avoid ReDoS).
+        const embedded = UnityVersion.tryParseEmbeddedChangeset(version);
+        if (embedded) {
+            version = embedded.version;
+            changeset = changeset ?? embedded.changeset;
+        }
         this.version = version;
         this.changeset = changeset;
         this.semVer = UnityVersion.createSemVer(version);
@@ -8647,9 +8752,12 @@ class UnityVersion {
                 this.logger.debug(`Found Unity ${latest.version}`);
                 return new UnityVersion(latest.version, null, this.architecture);
             }
+            throw new Error(`No Unity release matching ${this.version} for channel(s) [${channels.join(', ')}]. ` +
+                (channels.length === 1 && channels[0] === 'f'
+                    ? `No stable (f) release for ${this.version}; use --channel b/a or a fully-qualified version (e.g. 6000.6.0b7).`
+                    : `Try a different --channel or a fully-qualified version.`));
         }
-        this.logger.debug(`No matching Unity version found for ${this.version}`);
-        return this;
+        throw new Error(`No matching Unity version found for ${this.version}`);
     }
     satisfies(version) {
         return (0, semver_1.satisfies)(version.semVer, `^${this.semVer.version}`);
@@ -8678,6 +8786,35 @@ class UnityVersion {
     }
     static UNITY_RELEASE_PATTERN = /^(\d{1,4})\.(\d+)\.(\d+)([abcfpx])(\d+)$/;
     static VERSION_TOKEN_PATTERN = /^(\d{1,4})(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?/;
+    /**
+     * Parses trailing " (hexchangeset)" without regex to avoid ReDoS on hostile input.
+     */
+    static tryParseEmbeddedChangeset(raw) {
+        if (!raw.endsWith(')')) {
+            return null;
+        }
+        const open = raw.lastIndexOf('(');
+        if (open <= 0 || raw[open - 1] !== ' ') {
+            return null;
+        }
+        const hex = raw.slice(open + 1, -1);
+        if (hex.length === 0) {
+            return null;
+        }
+        for (let i = 0; i < hex.length; i++) {
+            const c = hex.charCodeAt(i);
+            const isHex = (c >= 48 && c <= 57) || // 0-9
+                (c >= 97 && c <= 102) || // a-f
+                (c >= 65 && c <= 70); // A-F
+            if (!isHex) {
+                return null;
+            }
+        }
+        return {
+            version: raw.slice(0, open - 1).trimEnd(),
+            changeset: hex,
+        };
+    }
     static UNITY_CHANNEL_ORDER = {
         a: 0,
         b: 1,
@@ -10020,15 +10157,69 @@ function tryParseJson(content) {
 
 /***/ }),
 
+/***/ 6239:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UTP_BENIGN_SEVERITY_REMAPS = void 0;
+exports.utpMessageMatchesBenignRemap = utpMessageMatchesBenignRemap;
+/**
+ * Known Unity/editor messages that are non-actionable despite elevated UTP severity.
+ * Kept in a leaf module (no imports) so normalize, summaries, and CI share one list
+ * without circular deps between utp.ts and logging.ts.
+ *
+ * Severity strings must match {@link Severity} in utp.ts.
+ */
+exports.UTP_BENIGN_SEVERITY_REMAPS = [
+    // Longer OpenCL form first so summary strip does not leave a "Failed to find a suitable" prefix.
+    { fragment: 'Failed to find a suitable OpenCL device, baking cannot use GPU lightmapper.', severity: 'Info' },
+    { fragment: 'OpenCL device, baking cannot use GPU lightmapper.', severity: 'Info' },
+    {
+        fragment: '~StackAllocator(ALLOC_TEMP_MAIN) m_LastAlloc not NULL. Did you forget to call FreeAllStackAllocations()?',
+        severity: 'Info',
+    },
+    // Windows hosted CI: WSAEACCES (10013) — player-connection multicast / socket bind. Unity falls back.
+    { fragment: 'Unable to join player connection multicast group', severity: 'Info' },
+    { fragment: 'Socket: bind failed', severity: 'Info' },
+    {
+        fragment: 'An attempt was made to access a socket in a way forbidden by its access permissions',
+        severity: 'Info',
+    },
+    { fragment: 'Access token is unavailable; failed to update', severity: 'Info' },
+];
+/** True if the message matches a known benign Unity/CI noise fragment. */
+function utpMessageMatchesBenignRemap(message) {
+    if (!message) {
+        return false;
+    }
+    for (const { fragment } of exports.UTP_BENIGN_SEVERITY_REMAPS) {
+        if (message.includes(fragment)) {
+            return true;
+        }
+    }
+    return false;
+}
+//# sourceMappingURL=utp-benign.js.map
+
+/***/ }),
+
 /***/ 6282:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = exports.Severity = exports.Phase = exports.UTPPlayerBuildInfo = exports.UTPTestStatus = exports.UTPQualitySettings = exports.UTPPlayerSystemInfo = exports.UTPBuildSettings = exports.UTPPlayerSettings = exports.UTPScreenSettings = exports.UTPTestPlan = exports.UTPCompiler = exports.UTPLogEntry = exports.UTPMemoryLeaks = exports.UTPMemoryLeak = exports.UTPAction = exports.UTPBase = void 0;
+exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = exports.Severity = exports.Phase = exports.UTPPlayerBuildInfo = exports.UTPTestStatus = exports.UTPQualitySettings = exports.UTPPlayerSystemInfo = exports.UTPBuildSettings = exports.UTPPlayerSettings = exports.UTPScreenSettings = exports.UTPTestPlan = exports.UTPCompiler = exports.UTPLogEntry = exports.UTPMemoryLeaks = exports.UTPMemoryLeak = exports.UTPAction = exports.UTPBase = exports.utpMessageMatchesBenignRemap = exports.UTP_BENIGN_SEVERITY_REMAPS = void 0;
+exports.isElevatedUtpSeverity = isElevatedUtpSeverity;
+exports.remapBenignUtpSeverity = remapBenignUtpSeverity;
 exports.normalizeTelemetryEntry = normalizeTelemetryEntry;
 const logging_1 = __nccwpck_require__(4486);
+const utp_benign_1 = __nccwpck_require__(6239);
+var utp_benign_2 = __nccwpck_require__(6239);
+Object.defineProperty(exports, "UTP_BENIGN_SEVERITY_REMAPS", ({ enumerable: true, get: function () { return utp_benign_2.UTP_BENIGN_SEVERITY_REMAPS; } }));
+Object.defineProperty(exports, "utpMessageMatchesBenignRemap", ({ enumerable: true, get: function () { return utp_benign_2.utpMessageMatchesBenignRemap; } }));
 class UTPBase {
     type;
     version;
@@ -10114,6 +10305,28 @@ var Severity;
     Severity["Exception"] = "Exception";
     Severity["Assert"] = "Assert";
 })(Severity || (exports.Severity = Severity = {}));
+/** Severities that normally fail builds / CI expected-success checks. */
+function isElevatedUtpSeverity(severity) {
+    return severity === Severity.Error
+        || severity === Severity.Exception
+        || severity === Severity.Assert;
+}
+/**
+ * Downgrades elevated severity on known benign messages. Mutates `utp`.
+ * @returns true when severity was changed.
+ */
+function remapBenignUtpSeverity(utp) {
+    if (!utp.message || !isElevatedUtpSeverity(utp.severity)) {
+        return false;
+    }
+    for (const { fragment, severity } of utp_benign_1.UTP_BENIGN_SEVERITY_REMAPS) {
+        if (utp.message.includes(fragment)) {
+            utp.severity = severity;
+            return true;
+        }
+    }
+    return false;
+}
 /**
  * Root-level JSON keys on UTP objects that this CLI recognizes. Other keys are still parsed
  * but reported via {@link normalizeTelemetryEntry}'s `unknownTopLevelKeys` for logging.
@@ -10151,8 +10364,9 @@ exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = new Set([
     'version',
 ]);
 /**
- * Normalizes UTP telemetry entries to canonical shapes. Unknown top-level keys are listed
- * for the caller to log (with the raw `##utp:` line when tailing logs).
+ * Normalizes UTP telemetry entries to canonical shapes and remaps known benign elevated
+ * severities. Unknown top-level keys are listed for the caller to log (with the raw
+ * `##utp:` line when tailing logs).
  */
 function normalizeTelemetryEntry(entry) {
     if (!entry || typeof entry !== 'object') {
@@ -10178,6 +10392,14 @@ function normalizeTelemetryEntry(entry) {
     if (utp.lineNumber === undefined && typeof utp.line === 'number') {
         utp.lineNumber = utp.line;
     }
+    // Canonicalize severity string casing from Unity payloads.
+    if (typeof utp.severity === 'string') {
+        const matched = Object.values(Severity).find(s => s.toLowerCase() === utp.severity.toLowerCase());
+        if (matched) {
+            utp.severity = matched;
+        }
+    }
+    remapBenignUtpSeverity(utp);
     if (!utp.type) {
         logging_1.Logger.instance.warn('UTP entry missing type property; telemetry entry may be ignored.');
     }
@@ -12322,6 +12544,9 @@ class Range {
   }
 
   parseRange (range) {
+    // strip build metadata so it can't bleed into the version
+    range = range.replace(BUILDSTRIPRE, '')
+
     // memoize range parsing for performance.
     // this is a very hot path, and fully deterministic.
     const memoOpts =
@@ -12447,12 +12672,16 @@ const debug = __nccwpck_require__(427)
 const SemVer = __nccwpck_require__(8088)
 const {
   safeRe: re,
+  src,
   t,
   comparatorTrimReplace,
   tildeTrimReplace,
   caretTrimReplace,
 } = __nccwpck_require__(9523)
 const { FLAG_INCLUDE_PRERELEASE, FLAG_LOOSE } = __nccwpck_require__(2293)
+
+// unbounded global build-metadata stripper used by parseRange
+const BUILDSTRIPRE = new RegExp(src[t.BUILD], 'g')
 
 const isNullSet = c => c.value === '<0.0.0-0'
 const isAny = c => c.value === ''
@@ -12494,6 +12723,11 @@ const parseComparator = (comp, options) => {
 
 const isX = id => !id || id.toLowerCase() === 'x' || id === '*'
 
+const invalidXRangeOrder = (M, m, p) => (
+  (isX(M) && !isX(m)) ||
+  (isX(m) && p && !isX(p))
+)
+
 // ~, ~> --> * (any, kinda silly)
 // ~2, ~2.x, ~2.x.x, ~>2, ~>2.x ~>2.x.x --> >=2.0.0 <3.0.0-0
 // ~2.0, ~2.0.x, ~>2.0, ~>2.0.x --> >=2.0.0 <2.1.0-0
@@ -12511,6 +12745,10 @@ const replaceTildes = (comp, options) => {
 
 const replaceTilde = (comp, options) => {
   const r = options.loose ? re[t.TILDELOOSE] : re[t.TILDE]
+  // if we're including prereleases in the match, then the lower bound is
+  // -0, the lowest possible prerelease value, just like x-ranges and carets.
+  // this keeps `~1.2` equivalent to the `1.2.x` x-range it's documented as.
+  const z = options.includePrerelease ? '-0' : ''
   return comp.replace(r, (_, M, m, p, pr) => {
     debug('tilde', comp, _, M, m, p, pr)
     let ret
@@ -12518,10 +12756,10 @@ const replaceTilde = (comp, options) => {
     if (isX(M)) {
       ret = ''
     } else if (isX(m)) {
-      ret = `>=${M}.0.0 <${+M + 1}.0.0-0`
+      ret = `>=${M}.0.0${z} <${+M + 1}.0.0-0`
     } else if (isX(p)) {
       // ~1.2 == >=1.2.0 <1.3.0-0
-      ret = `>=${M}.${m}.0 <${M}.${+m + 1}.0-0`
+      ret = `>=${M}.${m}.0${z} <${M}.${+m + 1}.0-0`
     } else if (pr) {
       debug('replaceTilde pr', pr)
       ret = `>=${M}.${m}.${p}-${pr
@@ -12590,10 +12828,10 @@ const replaceCaret = (comp, options) => {
       if (M === '0') {
         if (m === '0') {
           ret = `>=${M}.${m}.${p
-          }${z} <${M}.${m}.${+p + 1}-0`
+          } <${M}.${m}.${+p + 1}-0`
         } else {
           ret = `>=${M}.${m}.${p
-          }${z} <${M}.${+m + 1}.0-0`
+          } <${M}.${+m + 1}.0-0`
         }
       } else {
         ret = `>=${M}.${m}.${p
@@ -12619,6 +12857,10 @@ const replaceXRange = (comp, options) => {
   const r = options.loose ? re[t.XRANGELOOSE] : re[t.XRANGE]
   return comp.replace(r, (ret, gtlt, M, m, p, pr) => {
     debug('xRange', comp, ret, gtlt, M, m, p, pr)
+    if (invalidXRangeOrder(M, m, p)) {
+      return comp
+    }
+
     const xM = isX(M)
     const xm = xM || isX(m)
     const xp = xm || isX(p)
@@ -12795,6 +13037,22 @@ const { safeRe: re, t } = __nccwpck_require__(9523)
 
 const parseOptions = __nccwpck_require__(785)
 const { compareIdentifiers } = __nccwpck_require__(5865)
+
+const isPrereleaseIdentifier = (prerelease, identifier) => {
+  const identifiers = identifier.split('.')
+  if (identifiers.length > prerelease.length) {
+    return false
+  }
+
+  for (let i = 0; i < identifiers.length; i++) {
+    if (compareIdentifiers(prerelease[i], identifiers[i]) !== 0) {
+      return false
+    }
+  }
+
+  return true
+}
+
 class SemVer {
   constructor (version, options) {
     options = parseOptions(options)
@@ -13098,8 +13356,9 @@ class SemVer {
           if (identifierBase === false) {
             prerelease = [identifier]
           }
-          if (compareIdentifiers(this.prerelease[0], identifier) === 0) {
-            if (isNaN(this.prerelease[1])) {
+          if (isPrereleaseIdentifier(this.prerelease, identifier)) {
+            const prereleaseBase = this.prerelease[identifier.split('.').length]
+            if (isNaN(prereleaseBase)) {
               this.prerelease = prerelease
             }
           } else {
@@ -14724,7 +14983,7 @@ const simpleSubset = (sub, dom, options) => {
         if (higher === c && higher !== gt) {
           return false
         }
-      } else if (gt.operator === '>=' && !satisfies(gt.semver, String(c), options)) {
+      } else if (gt.operator === '>=' && !c.test(gt.semver)) {
         return false
       }
     }
@@ -14742,7 +15001,7 @@ const simpleSubset = (sub, dom, options) => {
         if (lower === c && lower !== lt) {
           return false
         }
-      } else if (lt.operator === '<=' && !satisfies(lt.semver, String(c), options)) {
+      } else if (lt.operator === '<=' && !c.test(lt.semver)) {
         return false
       }
     }
@@ -18183,7 +18442,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -18194,7 +18459,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -19231,7 +19501,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -19572,6 +19841,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -19619,6 +19889,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -19841,27 +20114,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -19888,6 +20203,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -19991,6 +20311,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -20167,6 +20492,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -20225,6 +20551,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -20235,8 +20564,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -20255,8 +20587,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -20266,10 +20600,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -20332,7 +20667,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -20370,6 +20705,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -20382,6 +20742,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -20439,8 +20825,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -20477,6 +20871,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -22349,6 +22744,7 @@ class DispatcherBase extends Dispatcher {
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
     }
   }
@@ -23925,6 +24321,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -24139,6 +24557,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -24160,6 +24584,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -28285,32 +28715,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -28440,7 +28863,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -28449,16 +28872,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -28601,7 +29088,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -41136,6 +41629,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(8380)
 const { PerMessageDeflate } = __nccwpck_require__(8236)
 const { MessageSizeExceededError } = __nccwpck_require__(8045)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -41156,18 +41654,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -41191,9 +41693,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -41358,10 +41860,12 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -41380,14 +41884,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -41457,8 +41964,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -42511,9 +43027,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -51645,7 +52164,7 @@ exports.visitAsync = visitAsync;
 
 /***/ }),
 
-/***/ 5560:
+/***/ 9852:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 "use strict";
@@ -51742,6 +52261,17 @@ const closePattern = /\\}/g;
 const commaPattern = /\\,/g;
 const periodPattern = /\\\./g;
 const EXPANSION_MAX = 100_000;
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+const EXPANSION_MAX_LENGTH = 4_000_000;
 function numeric(str) {
     return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
 }
@@ -51791,7 +52321,7 @@ function expand(str, options = {}) {
     if (!str) {
         return [];
     }
-    const { max = EXPANSION_MAX } = options;
+    const { max = EXPANSION_MAX, maxLength = EXPANSION_MAX_LENGTH } = options;
     // I don't know why Bash 4.3 does this, but it does.
     // Anything starting with {} will have the first two bytes preserved
     // but *only* at the top level, so {},a}b will not expand to anything,
@@ -51801,7 +52331,7 @@ function expand(str, options = {}) {
     if (str.slice(0, 2) === '{}') {
         str = '\\{\\}' + str.slice(2);
     }
-    return expand_(escapeBraces(str), max, true).map(unescapeBraces);
+    return expand_(escapeBraces(str), max, maxLength, true).map(unescapeBraces);
 }
 function embrace(str) {
     return '{' + str + '}';
@@ -51815,22 +52345,117 @@ function lte(i, y) {
 function gte(i, y) {
     return i >= y;
 }
-function expand_(str, max, isTop) {
-    /** @type {string[]} */
-    const expansions = [];
-    const m = balanced('{', '}', str);
-    if (!m)
-        return [str];
-    // no need to expand pre, since it is guaranteed to be free of brace-sets
-    const pre = m.pre;
-    const post = m.post.length ? expand_(m.post, max, false) : [''];
-    if (/\$$/.test(m.pre)) {
-        for (let k = 0; k < post.length && k < max; k++) {
-            const expansion = pre + '{' + m.body + '}' + post[k];
-            expansions.push(expansion);
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(acc, pre, values, max, maxLength, dropEmpties) {
+    const out = [];
+    let length = 0;
+    for (let a = 0; a < acc.length; a++) {
+        for (let v = 0; v < values.length; v++) {
+            if (out.length >= max)
+                return out;
+            const expansion = acc[a] + pre + values[v];
+            // Bash drops empty results at the top level. Skip them before they count
+            // against `max`, so `max` bounds the number of *kept* results.
+            if (dropEmpties && !expansion)
+                continue;
+            if (length + expansion.length > maxLength)
+                return out;
+            out.push(expansion);
+            length += expansion.length;
         }
     }
-    else {
+    return out;
+}
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(body, isAlphaSequence, max, maxLength) {
+    const n = body.split(/\.\./);
+    const N = [];
+    // A sequence body always splits into two or three parts, but the compiler
+    // can't know that.
+    /* c8 ignore start */
+    if (n[0] === undefined || n[1] === undefined) {
+        return N;
+    }
+    /* c8 ignore stop */
+    const x = numeric(n[0]);
+    const y = numeric(n[1]);
+    const width = Math.max(n[0].length, n[1].length);
+    let incr = n.length === 3 && n[2] !== undefined ?
+        Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+    let test = lte;
+    const reverse = y < x;
+    if (reverse) {
+        incr *= -1;
+        test = gte;
+    }
+    const pad = n.some(isPadded);
+    let length = 0;
+    for (let i = x; test(i, y) && N.length < max; i += incr) {
+        let c;
+        if (isAlphaSequence) {
+            c = String.fromCharCode(i);
+            if (c === '\\') {
+                c = '';
+            }
+        }
+        else {
+            c = String(i);
+            if (pad) {
+                const need = width - c.length;
+                if (need > 0) {
+                    const z = new Array(need + 1).join('0');
+                    if (i < 0) {
+                        c = '-' + z + c.slice(1);
+                    }
+                    else {
+                        c = z + c;
+                    }
+                }
+            }
+        }
+        if (length + c.length > maxLength)
+            break;
+        N.push(c);
+        length += c.length;
+    }
+    return N;
+}
+function expand_(str, max, maxLength, isTop) {
+    // Consume the string's top-level brace groups left to right, threading a
+    // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+    // rather than recursing on `m.post` once per group - keeps the native stack
+    // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+    // longer overflow the stack, and leaves a single accumulator whose size
+    // `maxLength` bounds directly (CVE-2026-14257).
+    let acc = [''];
+    // Bash drops empty results, but only when the *first* top-level group is a
+    // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+    // is on the final strings, so it is applied to whichever `combine` produces
+    // them (the one with no brace set left in the tail).
+    let dropEmpties = false;
+    let firstGroup = true;
+    for (;;) {
+        const m = balanced('{', '}', str);
+        // No brace set left: the rest of the string is literal.
+        if (!m) {
+            return combine(acc, str, [''], max, maxLength, dropEmpties);
+        }
+        // no need to expand pre, since it is guaranteed to be free of brace-sets
+        const pre = m.pre;
+        if (/\$$/.test(pre)) {
+            acc = combine(acc, pre + '{' + m.body + '}', [''], max, maxLength, dropEmpties && !m.post.length);
+            firstGroup = false;
+            if (!m.post.length)
+                break;
+            str = m.post;
+            continue;
+        }
         const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
         const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
         const isSequence = isNumericSequence || isAlphaSequence;
@@ -51839,87 +52464,69 @@ function expand_(str, max, isTop) {
             // {a},b}
             if (m.post.match(/,(?!,).*\}/)) {
                 str = m.pre + '{' + m.body + escClose + m.post;
-                return expand_(str, max, true);
+                isTop = true;
+                continue;
             }
-            return [str];
+            // Nothing here expands, so the whole remaining string is literal.
+            return combine(acc, pre + '{' + m.body + '}' + m.post, [''], max, maxLength, dropEmpties);
         }
-        let n;
+        if (firstGroup) {
+            dropEmpties = isTop && !isSequence;
+            firstGroup = false;
+        }
+        let values;
         if (isSequence) {
-            n = m.body.split(/\.\./);
+            values = expandSequence(m.body, isAlphaSequence, max, maxLength);
         }
         else {
-            n = parseCommaParts(m.body);
+            let n = parseCommaParts(m.body);
             if (n.length === 1 && n[0] !== undefined) {
                 // x{{a,b}}y ==> x{a}y x{b}y
-                n = expand_(n[0], max, false).map(embrace);
+                n = expand_(n[0], max, maxLength, false).map(embrace);
                 //XXX is this necessary? Can't seem to hit it in tests.
                 /* c8 ignore start */
                 if (n.length === 1) {
-                    return post.map(p => m.pre + n[0] + p);
+                    acc = combine(acc, pre + n[0], [''], max, maxLength, dropEmpties && !m.post.length);
+                    if (!m.post.length)
+                        break;
+                    str = m.post;
+                    continue;
                 }
                 /* c8 ignore stop */
             }
-        }
-        // at this point, n is the parts, and we know it's not a comma set
-        // with a single entry.
-        let N;
-        if (isSequence && n[0] !== undefined && n[1] !== undefined) {
-            const x = numeric(n[0]);
-            const y = numeric(n[1]);
-            const width = Math.max(n[0].length, n[1].length);
-            let incr = n.length === 3 && n[2] !== undefined ?
-                Math.max(Math.abs(numeric(n[2])), 1)
-                : 1;
-            let test = lte;
-            const reverse = y < x;
-            if (reverse) {
-                incr *= -1;
-                test = gte;
+            // Values that `combine` is going to drop as empty produce no result, so
+            // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
+            // would stop at `['a', '']` and yield one result instead of two. Skipping
+            // them outright keeps `values` bounded while leaving `max` a bound on
+            // *kept* results.
+            let dropsEmpties = dropEmpties && !m.post.length && !pre;
+            for (let d = 0; dropsEmpties && d < acc.length; d++) {
+                if (acc[d]) {
+                    dropsEmpties = false;
+                }
             }
-            const pad = n.some(isPadded);
-            N = [];
-            for (let i = x; test(i, y) && N.length < max; i += incr) {
-                let c;
-                if (isAlphaSequence) {
-                    c = String.fromCharCode(i);
-                    if (c === '\\') {
-                        c = '';
+            values = [];
+            let valuesLength = 0;
+            outer: for (let j = 0; j < n.length; j++) {
+                const expanded = expand_(n[j], max, maxLength, false);
+                for (let k = 0; k < expanded.length; k++) {
+                    const v = expanded[k];
+                    if (dropsEmpties && !v)
+                        continue;
+                    if (values.length >= max || valuesLength + v.length > maxLength) {
+                        break outer;
                     }
-                }
-                else {
-                    c = String(i);
-                    if (pad) {
-                        const need = width - c.length;
-                        if (need > 0) {
-                            const z = new Array(need + 1).join('0');
-                            if (i < 0) {
-                                c = '-' + z + c.slice(1);
-                            }
-                            else {
-                                c = z + c;
-                            }
-                        }
-                    }
-                }
-                N.push(c);
-            }
-        }
-        else {
-            N = [];
-            for (let j = 0; j < n.length; j++) {
-                N.push.apply(N, expand_(n[j], max, false));
-            }
-        }
-        for (let j = 0; j < N.length; j++) {
-            for (let k = 0; k < post.length && expansions.length < max; k++) {
-                const expansion = pre + N[j] + post[k];
-                if (!isTop || isSequence || expansion) {
-                    expansions.push(expansion);
+                    values.push(v);
+                    valuesLength += v.length;
                 }
             }
         }
+        acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length);
+        if (!m.post.length)
+            break;
+        str = m.post;
     }
-    return expansions;
+    return acc;
 }
 //# sourceMappingURL=index.js.map
 ;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/assert-valid-pattern.js
@@ -53056,12 +53663,12 @@ const defaultPlatform = (typeof process === 'object' && process ?
         process.env.__MINIMATCH_TESTING_PLATFORM__) ||
         process.platform
     : 'posix');
-const esm_path = {
+const path = {
     win32: { sep: '\\' },
     posix: { sep: '/' },
 };
 /* c8 ignore stop */
-const sep = defaultPlatform === 'win32' ? esm_path.win32.sep : esm_path.posix.sep;
+const sep = defaultPlatform === 'win32' ? path.win32.sep : path.posix.sep;
 minimatch.sep = sep;
 const GLOBSTAR = Symbol('globstar **');
 minimatch.GLOBSTAR = GLOBSTAR;
@@ -54199,6 +54806,7 @@ function getFileIntegrityFromBuffer(data) {
 
 
 const UINT32_MAX = 2 ** 32 - 1;
+const SYMLINK_MAX_DEPTH = 40; // matches Linux SYMLOOP_MAX
 // Files smaller than this use buffer-based integrity hashing (avoids stream overhead).
 // Files larger than this use streaming to avoid holding large buffers in memory.
 const BUFFER_HASH_THRESHOLD = 2 * 1024 * 1024; // 2MB
@@ -54327,13 +54935,15 @@ class Filesystem {
         if (process.platform !== 'win32' && file.stat.mode & 0o100) {
             node.executable = true;
         }
-        node.integrity = await getFileIntegrity(streamGenerator());
+        // Integrity must be computed over the transformed bytes that are actually
+        // stored in the archive, not the original (pre-transform) source bytes.
+        node.integrity = await getFileIntegrity(wrappedFs.createReadStream(file.transformed.path));
         this.offset += BigInt(size);
     }
     insertLink(p, shouldUnpack, parentPath = wrappedFs.realpathSync(external_node_path_.dirname(p)), symlink = wrappedFs.readlinkSync(p), // /var/tmp => /private/var
     src = wrappedFs.realpathSync(this.src)) {
         const link = this.resolveLink(src, parentPath, symlink);
-        if (link.startsWith('..')) {
+        if (external_node_path_.isAbsolute(link) || external_node_path_.normalize(link).startsWith('..')) {
             throw new Error(`${p}: file "${link}" links out of the package`);
         }
         const node = this.searchNodeFromPath(p);
@@ -54345,7 +54955,13 @@ class Filesystem {
         return link;
     }
     resolveLink(src, parentPath, symlink) {
-        const target = external_node_path_.join(parentPath, symlink);
+        // Use path.resolve (not path.join) so that an absolute symlink target is
+        // honored as-is instead of being concatenated onto parentPath. With join,
+        // an absolute target's leading separator is swallowed, producing a broken
+        // relative link for in-package targets and silently bypassing the
+        // out-of-package guard for targets outside the package. resolve handles
+        // both absolute and relative targets through a single code path.
+        const target = external_node_path_.resolve(parentPath, symlink);
         const link = external_node_path_.relative(src, target);
         return link;
     }
@@ -54365,11 +54981,19 @@ class Filesystem {
         fillFilesFromMetadata('/', this.header);
         return files;
     }
-    getNode(p, followLinks = true) {
+    getNode(p, followLinks = true, depth = 0, visited = new Set()) {
         const node = this.searchNodeFromDirectory(external_node_path_.dirname(p));
         const name = external_node_path_.basename(p);
         if ('link' in node && followLinks) {
-            return this.getNode(external_node_path_.join(node.link, name));
+            const resolvedPath = external_node_path_.join(node.link, name);
+            if (visited.has(resolvedPath)) {
+                throw new Error(`"${p}": circular symlink detected at "${resolvedPath}"`);
+            }
+            if (depth >= SYMLINK_MAX_DEPTH) {
+                throw new Error(`"${p}": too many levels of symbolic links (>${SYMLINK_MAX_DEPTH})`);
+            }
+            visited.add(resolvedPath);
+            return this.getNode(resolvedPath, followLinks, depth + 1, visited);
         }
         if (name) {
             return node.files[name];
@@ -54378,14 +55002,22 @@ class Filesystem {
             return node;
         }
     }
-    getFile(p, followLinks = true) {
-        const info = this.getNode(p, followLinks);
+    getFile(p, followLinks = true, depth = 0, visited = new Set()) {
+        const info = this.getNode(p, followLinks, depth, visited);
         if (!info) {
             throw new Error(`"${p}" was not found in this archive`);
         }
         // if followLinks is false we don't resolve symlinks
         if ('link' in info && followLinks) {
-            return this.getFile(info.link, followLinks);
+            const link = info.link;
+            if (visited.has(link)) {
+                throw new Error(`"${p}": circular symlink detected at "${link}"`);
+            }
+            if (depth >= SYMLINK_MAX_DEPTH) {
+                throw new Error(`"${p}": too many levels of symbolic links (>${SYMLINK_MAX_DEPTH})`);
+            }
+            visited.add(link);
+            return this.getFile(link, followLinks, depth + 1, visited);
         }
         else {
             return info;
@@ -54393,6 +55025,23 @@ class Filesystem {
     }
 }
 //# sourceMappingURL=filesystem.js.map
+;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/path-validation.js
+
+/**
+ * Validates that a resolved child path is strictly within a container directory.
+ * Uses path.resolve (not realpath) so it works before paths exist on disk.
+ * Throws if the resolved path escapes the container via traversal sequences.
+ */
+function path_validation_ensureWithin(container, filePath) {
+    const resolvedContainer = external_node_path_.resolve(container);
+    const resolvedPath = external_node_path_.resolve(resolvedContainer, filePath);
+    if (!resolvedPath.startsWith(resolvedContainer + external_node_path_.sep) &&
+        resolvedPath !== resolvedContainer) {
+        throw new Error(`Path "${filePath}" resolves to "${resolvedPath}" which is outside "${resolvedContainer}"`);
+    }
+    return resolvedPath;
+}
+//# sourceMappingURL=path-validation.js.map
 ;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/pickle.js
 // sizeof(T).
 const SIZE_INT32 = 4;
@@ -54605,7 +55254,123 @@ class Pickle {
 
 
 
+
 let filesystemCache = Object.create(null);
+class HeaderValidationError extends Error {
+    constructor(path, message) {
+        super(`Invalid archive header at "${path}": ${message}`);
+        this.name = 'HeaderValidationError';
+    }
+}
+function validateFileEntry(entry, entryPath) {
+    if (typeof entry.offset !== 'string') {
+        throw new HeaderValidationError(entryPath, `"offset" must be a string, got ${typeof entry.offset}`);
+    }
+    if (!/^\d+$/.test(entry.offset)) {
+        throw new HeaderValidationError(entryPath, `"offset" must be a numeric string, got "${entry.offset}"`);
+    }
+    if (typeof entry.size !== 'number' || !Number.isFinite(entry.size) || entry.size < 0) {
+        throw new HeaderValidationError(entryPath, `"size" must be a non-negative number, got ${JSON.stringify(entry.size)}`);
+    }
+    if (entry.unpacked !== undefined && typeof entry.unpacked !== 'boolean') {
+        throw new HeaderValidationError(entryPath, `"unpacked" must be a boolean, got ${typeof entry.unpacked}`);
+    }
+    if (entry.executable !== undefined && typeof entry.executable !== 'boolean') {
+        throw new HeaderValidationError(entryPath, `"executable" must be a boolean, got ${typeof entry.executable}`);
+    }
+    if (entry.integrity !== undefined) {
+        validateIntegrity(entry.integrity, entryPath);
+    }
+}
+function validateUnpackedFileEntry(entry, entryPath) {
+    if (typeof entry.size !== 'number' || !Number.isFinite(entry.size) || entry.size < 0) {
+        throw new HeaderValidationError(entryPath, `"size" must be a non-negative number, got ${JSON.stringify(entry.size)}`);
+    }
+    if (entry.unpacked !== true) {
+        throw new HeaderValidationError(entryPath, `"unpacked" must be true for unpacked file entries`);
+    }
+    if (entry.executable !== undefined && typeof entry.executable !== 'boolean') {
+        throw new HeaderValidationError(entryPath, `"executable" must be a boolean, got ${typeof entry.executable}`);
+    }
+    if (entry.integrity !== undefined) {
+        validateIntegrity(entry.integrity, entryPath);
+    }
+}
+function validateIntegrity(integrity, entryPath) {
+    if (typeof integrity !== 'object' || integrity === null || Array.isArray(integrity)) {
+        throw new HeaderValidationError(entryPath, `"integrity" must be an object`);
+    }
+    const rec = integrity;
+    if (typeof rec.algorithm !== 'string') {
+        throw new HeaderValidationError(entryPath, `"integrity.algorithm" must be a string`);
+    }
+    if (typeof rec.hash !== 'string') {
+        throw new HeaderValidationError(entryPath, `"integrity.hash" must be a string`);
+    }
+    if (typeof rec.blockSize !== 'number' || !Number.isFinite(rec.blockSize) || rec.blockSize <= 0) {
+        throw new HeaderValidationError(entryPath, `"integrity.blockSize" must be a positive number`);
+    }
+    if (!Array.isArray(rec.blocks)) {
+        throw new HeaderValidationError(entryPath, `"integrity.blocks" must be an array`);
+    }
+    for (let i = 0; i < rec.blocks.length; i++) {
+        if (typeof rec.blocks[i] !== 'string') {
+            throw new HeaderValidationError(entryPath, `"integrity.blocks[${i}]" must be a string`);
+        }
+    }
+}
+function validateLinkEntry(entry, entryPath) {
+    if (typeof entry.link !== 'string') {
+        throw new HeaderValidationError(entryPath, `"link" must be a string, got ${typeof entry.link}`);
+    }
+    if (entry.link.length === 0) {
+        throw new HeaderValidationError(entryPath, `"link" must not be empty`);
+    }
+}
+function validateDirectoryEntry(entry, entryPath) {
+    if (typeof entry.files !== 'object' || entry.files === null || Array.isArray(entry.files)) {
+        throw new HeaderValidationError(entryPath, `"files" must be a plain object`);
+    }
+    const files = entry.files;
+    for (const [name, child] of Object.entries(files)) {
+        if (name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+            throw new HeaderValidationError(entryPath, `invalid entry name "${name}"`);
+        }
+        const childPath = entryPath === '/' ? `/${name}` : `${entryPath}/${name}`;
+        validateHeaderEntry(child, childPath);
+    }
+}
+function validateHeaderEntry(entry, entryPath) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        throw new HeaderValidationError(entryPath, 'entry must be an object');
+    }
+    const rec = entry;
+    if ('link' in rec) {
+        validateLinkEntry(rec, entryPath);
+    }
+    else if ('files' in rec) {
+        validateDirectoryEntry(rec, entryPath);
+    }
+    else if ('offset' in rec) {
+        validateFileEntry(rec, entryPath);
+    }
+    else if ('unpacked' in rec && rec.unpacked === true && 'size' in rec) {
+        validateUnpackedFileEntry(rec, entryPath);
+    }
+    else {
+        throw new HeaderValidationError(entryPath, 'entry must be a directory (with "files"), a file (with "offset" or "unpacked"), or a link (with "link")');
+    }
+}
+function validateHeader(header) {
+    if (typeof header !== 'object' || header === null || Array.isArray(header)) {
+        throw new HeaderValidationError('/', 'header must be an object');
+    }
+    const rec = header;
+    if (!('files' in rec)) {
+        throw new HeaderValidationError('/', 'root header must be a directory with a "files" property');
+    }
+    validateDirectoryEntry(rec, '/');
+}
 async function copyFile(dest, src, filename) {
     const srcFile = external_node_path_.join(src, filename);
     const targetFile = external_node_path_.join(dest, filename);
@@ -54700,12 +55465,16 @@ function readArchiveHeaderSync(archivePath) {
     let size;
     let headerBuf;
     try {
+        const archiveSize = wrappedFs.fstatSync(fd).size;
         const sizeBuf = Buffer.alloc(8);
         if (wrappedFs.readSync(fd, sizeBuf, 0, 8, null) !== 8) {
             throw new Error('Unable to read header size');
         }
         const sizePickle = Pickle.createFromBuffer(sizeBuf);
         size = sizePickle.createIterator().readUInt32();
+        if (size < 0 || size > archiveSize - 8) {
+            throw new Error(`Header size ${size} exceeds archive size ${archiveSize}. The archive is corrupted.`);
+        }
         headerBuf = Buffer.alloc(size);
         if (wrappedFs.readSync(fd, headerBuf, 0, size, null) !== size) {
             throw new Error('Unable to read header');
@@ -54716,7 +55485,9 @@ function readArchiveHeaderSync(archivePath) {
     }
     const headerPickle = Pickle.createFromBuffer(headerBuf);
     const header = headerPickle.createIterator().readString();
-    return { headerString: header, header: JSON.parse(header), headerSize: size };
+    const parsedHeader = JSON.parse(header);
+    validateHeader(parsedHeader);
+    return { headerString: header, header: parsedHeader, headerSize: size };
 }
 function readFilesystemSync(archivePath) {
     if (!filesystemCache[archivePath]) {
@@ -54738,27 +55509,37 @@ function uncacheAll() {
     filesystemCache = {};
 }
 function readFileSync(filesystem, filename, info) {
-    let buffer = Buffer.alloc(info.size);
     if (info.size <= 0) {
-        return buffer;
+        return Buffer.alloc(0);
     }
     if (info.unpacked) {
         // it's an unpacked file, copy it.
-        buffer = wrappedFs.readFileSync(external_node_path_.join(`${filesystem.getRootPath()}.unpacked`, filename));
+        const unpackedDir = `${filesystem.getRootPath()}.unpacked`;
+        return wrappedFs.readFileSync(path_validation_ensureWithin(unpackedDir, filename));
     }
-    else {
-        // Node throws an exception when reading 0 bytes into a 0-size buffer,
-        // so we short-circuit the read in this case.
-        const fd = wrappedFs.openSync(filesystem.getRootPath(), 'r');
-        try {
-            const offset = 8 + filesystem.getHeaderSize() + parseInt(info.offset);
-            wrappedFs.readSync(fd, buffer, 0, info.size, offset);
+    // Node throws an exception when reading 0 bytes into a 0-size buffer,
+    // so we short-circuit the read in this case.
+    const fd = wrappedFs.openSync(filesystem.getRootPath(), 'r');
+    try {
+        const fileOffset = parseInt(info.offset);
+        if (Number.isNaN(fileOffset) || fileOffset < 0 || !Number.isSafeInteger(fileOffset)) {
+            throw new Error(`Invalid file offset in archive header: ${info.offset}`);
         }
-        finally {
-            wrappedFs.closeSync(fd);
+        const offset = 8 + filesystem.getHeaderSize() + fileOffset;
+        if (!Number.isSafeInteger(offset)) {
+            throw new Error(`Computed offset exceeds safe integer range`);
         }
+        const archiveSize = wrappedFs.fstatSync(fd).size;
+        if (offset < 0 || offset + info.size > archiveSize) {
+            throw new Error(`File entry extends beyond archive boundary (offset=${offset}, size=${info.size}, archiveSize=${archiveSize})`);
+        }
+        const buffer = Buffer.alloc(info.size);
+        wrappedFs.readSync(fd, buffer, 0, info.size, offset);
+        return buffer;
     }
-    return buffer;
+    finally {
+        wrappedFs.closeSync(fd);
+    }
 }
 function readFileWithFd(fd, filesystem, filename, info) {
     let buffer = Buffer.alloc(info.size);
@@ -54766,7 +55547,8 @@ function readFileWithFd(fd, filesystem, filename, info) {
         return buffer;
     }
     if (info.unpacked) {
-        buffer = fs.readFileSync(path.join(`${filesystem.getRootPath()}.unpacked`, filename));
+        const unpackedDir = `${filesystem.getRootPath()}.unpacked`;
+        buffer = fs.readFileSync(ensureWithin(unpackedDir, filename));
     }
     else {
         const offset = 8 + filesystem.getHeaderSize() + parseInt(info.offset);
@@ -54880,6 +55662,7 @@ async function crawl(dir, options) {
 }
 //# sourceMappingURL=crawlfs.js.map
 ;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/asar.js
+
 
 
 
@@ -55133,11 +55916,8 @@ function extractAll(archivePath, dest) {
     for (const fullPath of filenames) {
         // Remove leading slash
         const filename = fullPath.substr(1);
-        const destFilename = external_node_path_.join(dest, filename);
+        const destFilename = path_validation_ensureWithin(dest, filename);
         const file = filesystem.getFile(filename, followLinks);
-        if (external_node_path_.relative(dest, destFilename).startsWith('..')) {
-            throw new Error(`${fullPath}: file "${destFilename}" writes out of the package`);
-        }
         if ('files' in file) {
             // it's a directory, create it and continue with the next entry
             wrappedFs.mkdirpSync(destFilename);
