@@ -1,7 +1,7 @@
-name: Buildalon create unity project from hub template
+name: 'Buildalon create unity project from hub template'
 branding:
   icon: cloud-lightning
-  color: red
+  color: 'red'
 description: A GitHub Action to create a new Unity Project using a predefined template package.
 inputs:
   project-name:

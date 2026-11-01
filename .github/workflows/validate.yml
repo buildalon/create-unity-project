@@ -15,39 +15,135 @@ jobs:
   setup:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-slim
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: .github/
       - uses: RageAgainstThePixel/job-builder@v1
         id: setup-jobs
         with:
           build-options: ./.github/workflows/build-options.json
+          # one group per editor version; every group runs at once, since macOS and Linux rows share one seat per OS
+          # and Windows rows return theirs
           group-by: 'unity-version'
     outputs:
       jobs: ${{ steps.setup-jobs.outputs.jobs }}
+  # One sign-in per OS for the whole run. macOS and Linux runners share one machine identity, so the license activated
+  # here serves every macOS or Linux row of this run, which then needs no sign-in of its own. It is passed on encrypted,
+  # because artifacts of a public repository can be downloaded by anyone, and it is never returned: a return would
+  # revoke it for every job on that identity, other repositories' included. license-cleanup deletes it after the run.
+  license:
+    if: github.event.pull_request.draft == false
+    name: license ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - name: Activate License
+        id: activate
+        shell: bash
+        env:
+          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          # the encryption key comes from a random token, never the account password, so the public artifact gives
+          # nobody a way to test password guesses offline
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UNITY_USERNAME}" ] || [ -z "${UNITY_PASSWORD}" ] || [ -z "${CI_TOKEN}" ]; then
+            # pull requests from forks get no secrets; their rows fall back to their own activation
+            echo '::warning::No Unity credentials or CI_TOKEN, so this run has no shared license'
+            exit 0
+          fi
+          # the unity-cli this action bundles
+          export PATH="${GITHUB_WORKSPACE}/node_modules/.bin:${PATH}"
+          unity-cli upm-install --json
+          # license-context runs after, only to explain a failure
+          code=0
+          unity-cli activate-license --license personal || code=$?
+          if [ "${code}" -ne 0 ]; then
+            unity-cli license-context || true
+            exit "${code}"
+          fi
+          dir="${RUNNER_TEMP}/unity-license"
+          mkdir -p "${dir}"
+          license_file="$(unity-cli license-file-path)"
+          # the key never reaches a command line: openssl reads it from the environment
+          export LICENSE_KEY="${CI_TOKEN}:${GITHUB_RUN_ID}"
+          if ! openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "${license_file}" -out "${dir}/unity-license.enc" -pass env:LICENSE_KEY; then
+            echo 'Could not encrypt the run license' >&2
+            exit 1
+          fi
+          echo "encrypted=true" >> "${GITHUB_OUTPUT}"
+      - uses: actions/upload-artifact@v7
+        if: ${{ steps.activate.outputs.encrypted == 'true' }}
+        with:
+          name: unity-license-${{ runner.os }}
+          path: ${{ runner.temp }}/unity-license/unity-license.enc
+          retention-days: 1
+          if-no-files-found: error
   validate:
-    if: ${{ needs.setup.outputs.jobs }}
-    needs: setup
+    # the rows still run when the license job fails, and activate with the account instead
+    if: ${{ !cancelled() && needs.setup.result == 'success' && needs.setup.outputs.jobs }}
+    needs: [setup, license]
     name: build ${{ matrix.jobs.name }}
     permissions:
       contents: read
     strategy:
       matrix: ${{ fromJSON(needs.setup.outputs.jobs) }}
       fail-fast: false
-      max-parallel: 1
     secrets: inherit
     uses: ./.github/workflows/build.yml
     with:
       matrix: ${{ toJSON(matrix.jobs.matrix) }}
+  license-cleanup:
+    needs: [license, validate]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # to delete this run's license artifacts
+    steps:
+      - name: Delete the run license
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! ids="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" --paginate --jq '.artifacts[] | select(.name | startswith("unity-license-")) | .id')"; then
+            echo 'Could not list the run artifacts' >&2
+            exit 1
+          fi
+          count=0
+          for id in ${ids}; do
+            if ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"; then
+              echo "Could not delete artifact ${id}" >&2
+              exit 1
+            fi
+            count=$((count + 1))
+          done
+          echo "Deleted ${count} license artifacts"
   timeline:
     needs: [setup, validate]
     if: always()
     runs-on: ubuntu-slim
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: Kesin11/actions-timeline@c2f474758e8e9ac6f37ec64a6442dead7fd1dad2 # v2.2.5
+      - uses: Kesin11/actions-timeline@460b1f8a750077029ad3589824d371b200e91dcf # v3.2.1
         continue-on-error: true
