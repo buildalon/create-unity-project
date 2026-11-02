@@ -1,6 +1,6 @@
 {
   "name": "create-unity-project",
-  "version": "2.1.1",
+  "version": "3.0.0",
   "description": "A GitHub Action to create a new Unity Project using a predefined template package.",
   "author": "buildalon",
   "repository": {
@@ -20,7 +20,7 @@
   "main": "dist/index.js",
   "dependencies": {
     "@actions/core": "^1.11.1",
-    "@rage-against-the-pixel/unity-cli": "^3.0.0"
+    "@rage-against-the-pixel/unity-cli": "^4.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.12.4",
@@ -36,9 +36,6 @@
   "overrides": {
     "@actions/core": {
       "@actions/http-client": "^3.0.2"
-    },
-    "@rage-against-the-pixel/unity-cli": {
-      "glob": "^13.0.6"
     }
   }
 }

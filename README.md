@@ -1,4 +1,4 @@
-# create-unity-project
+# Buildalon create unity project from hub template
 
 [![Discord](https://img.shields.io/discord/939721153688264824.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/VM9cWJ9rjH) [![marketplace](https://img.shields.io/static/v1?label=&labelColor=505050&message=Buildalon%20Actions&color=FF1E6F&logo=github-actions&logoColor=0076D6)](https://github.com/marketplace?query=buildalon)
 
@@ -26,7 +26,7 @@ A GitHub Action to create a new Unity Project using a predefined template packag
 
 ```yaml
 steps:
-  - uses: buildalon/create-unity-project@v2
+  - uses: buildalon/create-unity-project@v3
     with:
       project-name: Test Project
       project-directory: ./Unity Project
@@ -46,5 +46,9 @@ steps:
 
 ### outputs
 
-- `project-path`: The path to the created Unity project. This is the absolute path to the project directory.
+- `project-path`: The path to the created Unity project, `<project-directory>/<project-name>`. It is relative when `project-directory` is relative.
 
+### notes
+
+- Templates are only used with Unity 2019 and newer. When no template matches `template-name`, the action warns and creates the project without one.
+- When creation fails for a reason a rerun can fix, the action adds a notice titled `unity-license-exhausted` or `unity-transient-failure` for [retry-failed-jobs](https://github.com/buildalon/retry-failed-jobs).
