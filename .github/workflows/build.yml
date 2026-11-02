@@ -7,6 +7,10 @@ on:
       matrix:
         required: true
         type: string
+      allow-security-alert:
+        required: false
+        type: boolean
+        default: false
     secrets:
       UNITY_USERNAME:
         required: true
@@ -27,6 +31,10 @@ jobs:
       fail-fast: false
     permissions:
       contents: read
+    env:
+      # the monthly run installs the older editors, which mostly carry a Unity Security Alert; the bundled unity-cli
+      # installs them with a warning instead of an error when this is set
+      UNITY_ALLOW_SECURITY_ALERT: ${{ inputs.allow-security-alert }}
     steps:
       # runs alongside checkout; the wait before the editor install joins it
       - name: Free Disk Space
@@ -57,7 +65,7 @@ jobs:
           set -euo pipefail
           npm ci
           npx --no-install unity-cli upm-install --json
-          npx --no-install unity-cli setup-unity --unity-version "${MATRIX_UNITY_VERSION}" --build-targets "${MATRIX_BUILD_TARGET}" --json
+          npx --no-install unity-cli setup-unity --unity-version "${MATRIX_UNITY_VERSION}" --build-targets "${MATRIX_BUILD_TARGET}" --channel f,b,a --json
       # macOS and Linux runners all report the same machine identity to Unity, so the license the license job activated
       # once for this run serves every macOS or Linux row; it arrives as an encrypted artifact and is never returned.
       # Without it, or when it no longer fits this machine, the row activates with the account. Windows runners are a
@@ -158,14 +166,14 @@ jobs:
           openupm add com.utilities.buildpipeline
         working-directory: ${{ steps.unity-project.outputs.project-path }}
         shell: bash
-      - uses: buildalon/unity-action@v3
+      - uses: buildalon/unity-action@v4
         name: ${{ matrix.build-target }}-Validate
         with:
           build-target: ${{ matrix.build-target }}
           project-path: ${{ steps.unity-project.outputs.project-path }}
           log-name: ${{ matrix.build-target }}-Validate
           args: -quit -nographics -batchmode -executeMethod Utilities.Editor.BuildPipeline.UnityPlayerBuildTools.ValidateProject -importTMProEssentialsAsset
-      - uses: buildalon/unity-action@v3
+      - uses: buildalon/unity-action@v4
         name: ${{ matrix.build-target }}-Build
         with:
           build-target: ${{ matrix.build-target }}

@@ -6705,6 +6705,34 @@ class UnityCli {
         }
         return envelope.data;
     }
+    /**
+     * The arguments that list the project templates for an editor: `templates --editor-version <version>`, or
+     * `templates list --editor <version>` for CLI 1.0.0-beta.14 and older, which have no `--editor-version` on `templates`.
+     * @param editorVersion The editor version to list templates for. Omitted, the CLI uses its stored default.
+     */
+    TemplatesListArgs(editorVersion = undefined) {
+        const legacy = (0, semver_1.valid)(this.version) !== null && (0, semver_1.compare)(this.version, '1.0.0-beta.15') < 0;
+        if (legacy) {
+            return ['templates', 'list', ...(editorVersion ? ['--editor', editorVersion] : [])];
+        }
+        return ['templates', ...(editorVersion ? ['--editor-version', editorVersion] : [])];
+    }
+    /**
+     * Lists the ids of the project templates the CLI offers for an editor, with the syntax this CLI version takes.
+     * @param editorVersion The editor version to list templates for. Omitted, the CLI uses its stored default.
+     * @returns The template ids, such as `com.unity.template.3d`, in the order they were listed.
+     * @throws If the templates could not be listed.
+     */
+    async ListTemplates(editorVersion = undefined) {
+        const data = await this.ExecJson(this.TemplatesListArgs(editorVersion));
+        // CLI 1.0.0-beta.15 and newer wrap the list in items
+        const templates = Array.isArray(data) ? data : data?.items;
+        return (templates ?? [])
+            // entries without a type, such as 7000.0's 3d and 2d at version 0.0.0, are the Hub's blank projects, not template packages
+            .filter(t => !!t.type)
+            .map(t => t.name || t.id)
+            .filter((id) => !!id);
+    }
     /** Gets the directory the CLI installs editors to. */
     async GetInstallPath() {
         const data = await this.ExecJson(['install-path', '--get']);
@@ -8784,9 +8812,11 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.ActionTableRenderer = void 0;
+exports.ActionTableRenderer = exports.FailureRecap = void 0;
 exports.isStackFrameLine = isStackFrameLine;
 exports.isErrorRecapLine = isErrorRecapLine;
+exports.isCrashLine = isCrashLine;
+exports.errorRecapLines = errorRecapLines;
 exports.sanitizeTelemetryJson = sanitizeTelemetryJson;
 exports.formatUtpUnrecognizedTopLevelPropertiesMessage = formatUtpUnrecognizedTopLevelPropertiesMessage;
 exports.describeUtpForUtpLogLevel = describeUtpForUtpLogLevel;
@@ -8830,8 +8860,164 @@ function isErrorRecapLine(line) {
         /\bfatal\b/i.test(line) ||
         /\bFailed to\b/i.test(line) ||
         /^Aborting batchmode/.test(line) ||
-        /No valid Unity Editor license found/.test(line);
+        /No valid Unity Editor license found/.test(line) ||
+        isCrashLine(line);
 }
+/**
+ * True for a line that reports a crashed process: a fatal signal, a core dump, an abort or running out of memory or stack.
+ * The failure recap lists these first, since they explain the generic errors that follow them.
+ * @param line A log line.
+ */
+function isCrashLine(line) {
+    return /\bSegmentation fault\b/i.test(line) ||
+        /\bcore dumped\b/i.test(line) ||
+        /\bSIG(?:SEGV|ABRT|BUS|ILL|FPE|KILL)\b/.test(line) ||
+        /\bAbort trap\b/i.test(line) ||
+        /\bBus error\b/i.test(line) ||
+        /\bOut of memory\b/i.test(line) ||
+        /\bStack overflow\b/i.test(line) ||
+        // the shell's bare reports for a process ended by SIGKILL or SIGABRT
+        /^(?:Killed|Aborted)$/.test(line.trim());
+}
+/**
+ * The lines of a multi-line error message that the failure recap lists: the first line, plus any crash lines and the
+ * exit code of a failed build step. Bee reports a failed tool as `##### CommandLine`, `##### ExitCode` and `##### Output`
+ * blocks under the command line, so without this the recap shows only the command line and loses the crash.
+ * @param message An error message, possibly spanning several lines.
+ * @returns The recap lines, crash and exit lines first.
+ */
+function errorRecapLines(message) {
+    const lines = message.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+    if (lines.length === 0) {
+        return [];
+    }
+    const first = lines[0];
+    const priority = [];
+    const exitIndex = lines.findIndex(line => line === '##### ExitCode');
+    const exitCode = exitIndex >= 0 ? lines[exitIndex + 1] : undefined;
+    const commandIndex = lines.findIndex(line => line === '##### CommandLine');
+    const command = (commandIndex >= 0 ? lines[commandIndex + 1] : undefined) ?? first;
+    const exitLine = exitCode ? buildStepExitLine(command, exitCode) : undefined;
+    if (exitLine) {
+        priority.push(exitLine);
+    }
+    for (const line of lines.slice(1)) {
+        if (isCrashLine(line) && line !== exitCode && !priority.includes(line)) {
+            priority.push(line);
+        }
+    }
+    return [...priority, first];
+}
+/**
+ * One recap line for a failed Bee build step, e.g. `il2cpp exited with code 139 (Segmentation fault)`.
+ * @param command The step's command line, if known.
+ * @param exitCode The line under `##### ExitCode`.
+ * @returns The line, or undefined when the step succeeded or the exit code is missing.
+ */
+function buildStepExitLine(command, exitCode) {
+    if (exitCode.length === 0 || exitCode.startsWith('#####') || /^0\b/.test(exitCode)) {
+        return undefined;
+    }
+    return `${command ? commandToolName(command) : 'A build step'} exited with code ${exitCode}`;
+}
+/** The file name of the program a command line runs, without its directory or quotes. */
+function commandToolName(command) {
+    const match = /^"([^"]+)"|^(\S+)/.exec(command.trim());
+    const program = match?.[1] ?? match?.[2] ?? command;
+    return program.split(/[\\/]/).pop() || program;
+}
+/**
+ * Collects the error lines a failed run lists after `Unity failed with exit code N`. Lines are kept once each, without
+ * stack frames, and capped. Crash lines and failed build step exits go first, in the order they appeared, and can push
+ * out ordinary lines once the cap is reached, so the cause is never the line that gets dropped.
+ */
+class FailureRecap {
+    maxLines;
+    /** The recap lines, crash and exit lines first. */
+    lines = [];
+    seen = new Set();
+    priorityCount = 0;
+    expecting;
+    blockCommand;
+    blockExitCode;
+    constructor(maxLines = MAX_RECAP_STORED_LINES) {
+        this.maxLines = maxLines;
+    }
+    /** How many distinct lines were recorded, including any beyond the cap. */
+    get count() {
+        return this.seen.size;
+    }
+    /**
+     * Records an error message reported through telemetry: its first line, plus its crash lines and failed step exit.
+     * @param message The message, possibly spanning several lines.
+     */
+    addMessage(message) {
+        const recapLines = errorRecapLines(message);
+        recapLines.forEach((line, index) => this.add(line, index < recapLines.length - 1 || isCrashLine(line)));
+    }
+    /**
+     * Follows one plain Editor log line. Error and crash lines are recorded, and a Bee `##### CommandLine` /
+     * `##### ExitCode` block printed line by line becomes a single exit line, as it does for telemetry messages.
+     * @param line The log line.
+     * @param isError Whether the line is an error the recap lists.
+     */
+    addPlainLine(line, isError) {
+        const trimmed = line.trim();
+        if (this.expecting === 'command') {
+            this.expecting = undefined;
+            this.blockCommand = trimmed;
+            return;
+        }
+        if (this.expecting === 'exit') {
+            this.expecting = undefined;
+            const exitLine = buildStepExitLine(this.blockCommand, trimmed);
+            if (exitLine) {
+                this.blockExitCode = trimmed;
+                this.add(exitLine, true);
+                return;
+            }
+        }
+        if (trimmed === '##### CommandLine') {
+            this.expecting = 'command';
+            this.blockCommand = undefined;
+            this.blockExitCode = undefined;
+            return;
+        }
+        if (trimmed === '##### ExitCode') {
+            this.expecting = 'exit';
+            return;
+        }
+        if ((isError || isCrashLine(trimmed)) && trimmed !== this.blockExitCode) {
+            this.add(trimmed);
+        }
+    }
+    /**
+     * Records one line.
+     * @param line The line.
+     * @param priority Whether it goes ahead of the ordinary lines.
+     */
+    add(line, priority = isCrashLine(line)) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0 || this.seen.has(trimmed) || isStackFrameLine(trimmed)) {
+            return;
+        }
+        this.seen.add(trimmed);
+        if (this.lines.length >= this.maxLines) {
+            // a full recap still takes a priority line, in place of its last ordinary one
+            if (!priority || this.priorityCount >= this.lines.length) {
+                return;
+            }
+            this.lines.pop();
+        }
+        if (priority) {
+            this.lines.splice(this.priorityCount++, 0, trimmed);
+        }
+        else {
+            this.lines.push(trimmed);
+        }
+    }
+}
+exports.FailureRecap = FailureRecap;
 // Detects workflow command markers to avoid emitting duplicate annotations
 const annotationCommandPrefixRegex = /\n::[a-z]+::/i;
 // Matches ANSI escape sequences (CSI and single-character)
@@ -9738,18 +9924,7 @@ function TailLogFile(logPath, projectPath, redactLiterals = []) {
     const actionTableRenderer = new ActionTableRenderer((0, utilities_1.isStdoutTTY)());
     const utpLogPath = buildUtpLogPath(logPath);
     let telemetryFlushed = false;
-    const errorLines = [];
-    const seenErrorLines = new Set();
-    const recordErrorLine = (line) => {
-        const trimmed = line.trim();
-        if (trimmed.length === 0 || seenErrorLines.has(trimmed) || isStackFrameLine(trimmed)) {
-            return;
-        }
-        seenErrorLines.add(trimmed);
-        if (errorLines.length < MAX_RECAP_STORED_LINES) {
-            errorLines.push(trimmed);
-        }
-    };
+    const recap = new FailureRecap();
     const buildIssueKey = (file, lineNo, message) => {
         const normalized = normalizeAnnotationPath(file, projectPath);
         const canonicalFile = (normalized.absoluteFile ?? normalizePathSlashes(file ?? '')).toLowerCase();
@@ -9830,7 +10005,7 @@ function TailLogFile(logPath, projectPath, redactLiterals = []) {
                 }
                 if (utp.message && 'severity' in utp && (0, utp_1.isElevatedUtpSeverity)(utp.severity)) {
                     // the message only; its stack trace stays out of the failure recap
-                    recordErrorLine(utp.message.split(/\r?\n/)[0] ?? '');
+                    recap.addMessage(utp.message);
                     const normalizedPath = normalizeAnnotationPath(utp.file, projectPath);
                     const stacktrace = sanitizeStackTrace(utp.stackTrace);
                     const message = stacktrace == undefined ? utp.message : `${utp.message}\n${stacktrace}`;
@@ -9871,16 +10046,15 @@ function TailLogFile(logPath, projectPath, redactLiterals = []) {
         else {
             // Skip plain-log false positives (e.g. "Socket: bind failed, error: …" matching \berror\b).
             if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(line)) {
+                recap.addPlainLine(line, false);
                 if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
                     process.stdout.write(`${line}\n`);
                 }
                 return;
             }
             const scan = parsePlainLogIssue(line);
-            if (((scan && scan.severity === utp_1.Severity.Error) || isErrorRecapLine(line)) &&
-                !(scan && (0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message))) {
-                recordErrorLine(line);
-            }
+            recap.addPlainLine(line, ((scan && scan.severity === utp_1.Severity.Error) || isErrorRecapLine(line)) &&
+                !(scan && (0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message)));
             if (scan) {
                 if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message)) {
                     if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
@@ -10037,7 +10211,7 @@ function TailLogFile(logPath, projectPath, redactLiterals = []) {
     function stopLogTail() {
         logEnded = true;
     }
-    return { tailPromise, stopLogTail, telemetry, errorLines, errorLineCount: () => seenErrorLines.size };
+    return { tailPromise, stopLogTail, telemetry, errorLines: recap.lines, errorLineCount: () => recap.count };
 }
 //# sourceMappingURL=unity-logging.js.map
 
@@ -45153,16 +45327,60 @@ module.exports = {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.GetAvailableTemplates = GetAvailableTemplates;
-exports.GetTemplatePath = GetTemplatePath;
+exports.ParseTemplatePrefixes = ParseTemplatePrefixes;
+exports.MatchTemplate = MatchTemplate;
+exports.GetBundledTemplates = GetBundledTemplates;
+exports.GetBundledTemplateId = GetBundledTemplateId;
 const fs = __nccwpck_require__(7147);
 const path = __nccwpck_require__(1017);
 const core = __nccwpck_require__(2186);
-function GetAvailableTemplates(unityEditor) {
-    if (unityEditor.version.isLessThan('2019.0.0')) {
-        core.warning(`Unity version ${unityEditor.version.toString()} does not support project templates.`);
-        return [];
+function ParseTemplatePrefixes(input) {
+    var _a;
+    const prefixes = [];
+    for (const entry of splitEntries(input).map(e => e.trim()).filter(e => e.length > 0)) {
+        const prefix = (_a = /^[\w.-]+/.exec(entry)) === null || _a === void 0 ? void 0 : _a[0];
+        if (!prefix) {
+            throw new Error(`Invalid template name: ${entry}. Use a template id such as com.unity.template.3d.`);
+        }
+        if (prefix !== entry) {
+            core.warning(`Template patterns are no longer supported; matching templates that start with ${prefix}.`);
+        }
+        prefixes.push(prefix);
     }
+    return prefixes;
+}
+function splitEntries(input) {
+    const entries = [];
+    let depth = 0;
+    let current = '';
+    for (const char of input) {
+        if ('([{'.includes(char)) {
+            depth++;
+        }
+        else if (')]}'.includes(char)) {
+            depth = Math.max(0, depth - 1);
+        }
+        else if (depth === 0 && ',\n|'.includes(char)) {
+            entries.push(current);
+            current = '';
+            continue;
+        }
+        current += char;
+    }
+    entries.push(current);
+    return entries;
+}
+function MatchTemplate(ids, prefixes) {
+    var _a;
+    for (const prefix of prefixes) {
+        const id = (_a = ids.find(i => i === prefix)) !== null && _a !== void 0 ? _a : ids.find(i => i.startsWith(prefix));
+        if (id) {
+            return id;
+        }
+    }
+    return undefined;
+}
+function GetBundledTemplates(unityEditor) {
     const editorRoot = path.dirname(unityEditor.editorPath);
     const templateDir = process.platform === 'darwin'
         ? path.join(path.dirname(editorRoot), 'Resources', 'PackageManager', 'ProjectTemplates')
@@ -45179,26 +45397,8 @@ function GetAvailableTemplates(unityEditor) {
     }
     return templates;
 }
-function GetTemplatePath(templates, template) {
-    if (templates.length === 0) {
-        core.warning('No Unity templates found');
-        return undefined;
-    }
-    let regex;
-    try {
-        regex = new RegExp(`^(?:${template})(?:-\\d+\\.\\d+\\.\\d+)?(?:\\.tgz|\\.tar\\.gz)$`);
-    }
-    catch (_a) {
-        throw new Error(`Invalid template regex: ${template}`);
-    }
-    const matches = templates
-        .filter(t => regex.test(path.basename(t)))
-        .sort((a, b) => b.length - a.length);
-    if (matches.length === 0) {
-        core.warning(`No matching template path found for ${template}`);
-        return undefined;
-    }
-    return path.normalize(matches[0]);
+function GetBundledTemplateId(templatePath) {
+    return path.basename(templatePath).replace(/(?:-\d+\.\d+\.\d+[\w.-]*?)?\.(?:tgz|tar\.gz)$/, '');
 }
 
 
@@ -45585,41 +45785,15 @@ async function main() {
         }
         const unityEditor = new unity_cli_1.UnityEditor(process.env.UNITY_EDITOR_PATH);
         core.info(`Using Unity Editor at path:\n  > ${unityEditor.editorPath}`);
-        let templatePath = undefined;
-        if (unityEditor.version.isGreaterThan('2019.0.0')) {
-            const availableTemplates = (0, templates_1.GetAvailableTemplates)(unityEditor);
-            core.startGroup('Available Unity Project Templates:');
-            for (const template of availableTemplates) {
-                core.info(`  - ${path.basename(template)}`);
-            }
-            core.endGroup();
-            templatePath = (0, templates_1.GetTemplatePath)(availableTemplates, core.getInput('template-name'));
-            core.info(`Using Unity template at path:\n  > ${templatePath}`);
-        }
-        else {
-            core.info('Unity Project Templates are not supported for Unity versions prior to 2019');
-        }
+        const prefixes = (0, templates_1.ParseTemplatePrefixes)(core.getInput('template-name'));
         const projectNameInput = core.getInput('project-name', { required: true });
         const projectDirectoryInput = core.getInput('project-directory') || process.cwd();
         const projectPath = `${projectDirectoryInput}/${projectNameInput}`;
-        core.info(`Creating Unity project at:\n  > ${projectPath}`);
-        const logPath = unityEditor.GenerateLogFilePath(projectPath, 'create-unity-project');
-        const args = [
-            `-logFile`, logPath,
-            '-quit',
-            '-createProject', projectPath,
-        ];
-        if (templatePath) {
-            args.push('-cloneFromTemplate', templatePath);
+        if (unityEditor.version.isLessThan('2019.1.0')) {
+            await createLegacyProject(unityEditor, projectPath, prefixes);
         }
-        try {
-            await unityEditor.Run({ args: [...args] });
-        }
-        catch (error) {
-            if (!projectCreated(projectPath, logPath)) {
-                throw error;
-            }
-            core.warning(`Unity exited with an error after creating the project, which is kept:\n${error instanceof Error ? error.message : String(error)}`);
+        else {
+            await createProject(unityEditor, projectDirectoryInput, projectNameInput, projectPath, prefixes);
         }
         core.setOutput('project-path', projectPath);
     }
@@ -45630,6 +45804,90 @@ async function main() {
             core.notice(`Retryable failure: ${message}`, { title: marker });
         }
         core.setFailed(message);
+    }
+}
+async function createProject(unityEditor, projectDirectory, projectName, projectPath, prefixes) {
+    const cli = await unity_cli_1.UnityCli.Get();
+    await registerEditor(cli, unityEditor);
+    const templates = await cli.ListTemplates(unityEditor.version.version);
+    core.startGroup('Available Unity Project Templates:');
+    for (const template of templates) {
+        core.info(`  - ${template}`);
+    }
+    core.endGroup();
+    if (prefixes.length === 0) {
+        throw new Error(`No template-name given. Available templates: ${templates.join(', ')}`);
+    }
+    const templateId = (0, templates_1.MatchTemplate)(templates, prefixes);
+    if (!templateId) {
+        throw new Error(`No Unity ${unityEditor.version.version} template matches ${prefixes.join(', ')}. Available templates: ${templates.join(', ')}`);
+    }
+    core.info(`Using Unity template:\n  > ${templateId}`);
+    core.info(`Creating Unity project at:\n  > ${projectPath}`);
+    await fs.promises.mkdir(path.resolve(projectDirectory), { recursive: true });
+    const args = [
+        'projects', 'create', projectName,
+        '--path', path.resolve(projectDirectory),
+        '--editor-version', unityEditor.version.version,
+        '--template', templateId,
+        '--no-cloud',
+        '--non-interactive',
+    ];
+    const result = await cli.Run(args, { stream: true });
+    if (result.exitCode !== 0) {
+        throw new Error(`unity ${args.join(' ')} failed with exit code ${result.exitCode}\n${`${result.stdout}\n${result.stderr}`.trim()}`);
+    }
+    if (!fs.existsSync(path.join(projectPath, 'ProjectSettings', 'ProjectVersion.txt'))) {
+        throw new Error(`The Unity CLI did not create a project at ${projectPath}`);
+    }
+}
+async function registerEditor(cli, unityEditor) {
+    const version = unityEditor.version.version;
+    const { exitCode, envelope } = await cli.RunJson(['editors', 'path', version]);
+    const registeredPath = exitCode === 0 && (envelope === null || envelope === void 0 ? void 0 : envelope.success) !== false ? (0, unity_cli_1.FindAbsolutePath)(envelope === null || envelope === void 0 ? void 0 : envelope.data) : undefined;
+    if (registeredPath) {
+        core.debug(`Unity ${version} is registered at ${registeredPath}`);
+        return;
+    }
+    core.info(`Registering Unity ${version} with the Unity CLI`);
+    await cli.Exec(['editors', 'add', unityEditor.editorPath, '--non-interactive']);
+}
+async function createLegacyProject(unityEditor, projectPath, prefixes) {
+    const templates = (0, templates_1.GetBundledTemplates)(unityEditor);
+    let templatePath = undefined;
+    if (templates.length > 0) {
+        core.startGroup('Bundled Unity Project Templates:');
+        for (const template of templates) {
+            core.info(`  - ${path.basename(template)}`);
+        }
+        core.endGroup();
+        const templateId = (0, templates_1.MatchTemplate)(templates.map(templates_1.GetBundledTemplateId), prefixes);
+        templatePath = templates.find(t => (0, templates_1.GetBundledTemplateId)(t) === templateId);
+    }
+    if (templatePath) {
+        core.info(`Using Unity template at path:\n  > ${templatePath}`);
+    }
+    else {
+        core.info(`Unity ${unityEditor.version.version} has no bundled template that matches, so the project is created without one`);
+    }
+    core.info(`Creating Unity project at:\n  > ${projectPath}`);
+    const logPath = unityEditor.GenerateLogFilePath(projectPath, 'create-unity-project');
+    const args = [
+        `-logFile`, logPath,
+        '-quit',
+        '-createProject', projectPath,
+    ];
+    if (templatePath) {
+        args.push('-cloneFromTemplate', templatePath);
+    }
+    try {
+        await unityEditor.Run({ args: [...args] });
+    }
+    catch (error) {
+        if (!projectCreated(projectPath, logPath)) {
+            throw error;
+        }
+        core.warning(`Unity exited with an error after creating the project, which is kept:\n${error instanceof Error ? error.message : String(error)}`);
     }
 }
 function projectCreated(projectPath, logPath) {
