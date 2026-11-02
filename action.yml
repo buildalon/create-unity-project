@@ -2,7 +2,7 @@ name: 'Buildalon create unity project from hub template'
 branding:
   icon: cloud-lightning
   color: 'red'
-description: A GitHub Action to create a new Unity Project using a predefined template package.
+description: A GitHub Action to create a new Unity Project from a Unity project template.
 inputs:
   project-name:
     description: The name of the Unity project to create.
@@ -12,9 +12,9 @@ inputs:
     required: false
     default: '${{ github.workspace }}'
   template-name:
-    description: The name of the template package to use for creating the Unity project.
+    description: A comma, newline or | separated list of template id prefixes, in order of preference. The first one the editor offers is used.
     required: false
-    default: 'com.unity.template.3d(-cross-platform)?'
+    default: 'com.unity.template.3d, com.unity.template.urp-blank'
 outputs:
   project-path:
     description: The path to the created Unity project.

@@ -4,16 +4,85 @@ import * as core from '@actions/core';
 import { UnityEditor } from '@rage-against-the-pixel/unity-cli';
 
 /**
- * Get a list of the project templates bundled with a Unity Editor.
+ * Parse the template-name input into an ordered list of template id prefixes.
+ * @param input A comma, newline or `|` separated list, such as `com.unity.template.3d, com.unity.template.urp-blank`.
+ * @returns The prefixes, in the order they were given.
+ * @throws If an entry has no template id in it.
+ */
+export function ParseTemplatePrefixes(input: string): string[] {
+    const prefixes: string[] = [];
+
+    for (const entry of splitEntries(input).map(e => e.trim()).filter(e => e.length > 0)) {
+        // v3 took a regex; its leading literal part, such as com.unity.template.3d, is matched as an id prefix
+        const prefix = /^[\w.-]+/.exec(entry)?.[0];
+
+        if (!prefix) {
+            throw new Error(`Invalid template name: ${entry}. Use a template id such as com.unity.template.3d.`);
+        }
+
+        if (prefix !== entry) {
+            core.warning(`Template patterns are no longer supported; matching templates that start with ${prefix}.`);
+        }
+
+        prefixes.push(prefix);
+    }
+
+    return prefixes;
+}
+
+/**
+ * Split the template-name input on commas, newlines and `|`, outside of brackets, so a v3 alternation such as
+ * `com.unity.template.3d|com.unity.template.urp-blank` keeps its fallbacks and `x{1,2}` stays one entry.
+ * @param input The template-name input.
+ * @returns The entries, untrimmed.
+ */
+function splitEntries(input: string): string[] {
+    const entries: string[] = [];
+    let depth = 0;
+    let current = '';
+
+    for (const char of input) {
+        if ('([{'.includes(char)) {
+            depth++;
+        } else if (')]}'.includes(char)) {
+            depth = Math.max(0, depth - 1);
+        } else if (depth === 0 && ',\n|'.includes(char)) {
+            entries.push(current);
+            current = '';
+            continue;
+        }
+
+        current += char;
+    }
+
+    entries.push(current);
+    return entries;
+}
+
+/**
+ * Pick the template for the first prefix that matches: an exact id first, then the first id that starts with it.
+ * @param ids The available template ids, in the order they were listed.
+ * @param prefixes The template id prefixes, in order of preference.
+ * @returns The matching template id, or undefined when no prefix matches.
+ */
+export function MatchTemplate(ids: string[], prefixes: string[]): string | undefined {
+    for (const prefix of prefixes) {
+        const id = ids.find(i => i === prefix) ?? ids.find(i => i.startsWith(prefix));
+
+        if (id) {
+            return id;
+        }
+    }
+
+    return undefined;
+}
+
+/**
+ * Get a list of the project templates bundled with a Unity Editor, for editors the official Unity CLI cannot create projects with.
  * @param unityEditor The Unity Editor to look in.
  * @returns The full paths of the available template packages.
  */
-export function GetAvailableTemplates(unityEditor: UnityEditor): string[] {
-    if (unityEditor.version.isLessThan('2019.0.0')) {
-        core.warning(`Unity version ${unityEditor.version.toString()} does not support project templates.`);
-        return [];
-    }
-
+export function GetBundledTemplates(unityEditor: UnityEditor): string[] {
     const editorRoot = path.dirname(unityEditor.editorPath);
     const templateDir = process.platform === 'darwin'
         ? path.join(path.dirname(editorRoot), 'Resources', 'PackageManager', 'ProjectTemplates')
@@ -37,39 +106,10 @@ export function GetAvailableTemplates(unityEditor: UnityEditor): string[] {
 }
 
 /**
- * Get the full path to a Unity project template based on the provided template name or regex pattern.
- * @param templates The available template paths.
- * @param template The name or regex pattern of the template to find.
- * @returns The full path to the matching template file, or undefined when none matches.
- * @throws If the template is not a valid regex.
+ * Get the template id of a bundled template package.
+ * @param templatePath The template package path, such as `.../com.unity.template.3d-1.2.3.tgz`.
+ * @returns The template id, such as `com.unity.template.3d`.
  */
-export function GetTemplatePath(templates: string[], template: string): string | undefined {
-    if (templates.length === 0) {
-        core.warning('No Unity templates found');
-        return undefined;
-    }
-
-    // Match the template name, an optional numeric version suffix, and a required file extension
-    // Example input: com.unity.template.3d(-cross-platform)?
-    // Example match: com.unity.template.3d-cross-platform-1.2.3.tar.gz or com.unity.template.3d-1.2.3.tgz
-    // the pattern is grouped so the anchors and suffix apply to every alternative, such as `a|b`
-    let regex: RegExp;
-
-    try {
-        regex = new RegExp(`^(?:${template})(?:-\\d+\\.\\d+\\.\\d+)?(?:\\.tgz|\\.tar\\.gz)$`);
-    } catch {
-        throw new Error(`Invalid template regex: ${template}`);
-    }
-
-    // prefer the longest match, such as the cross-platform variant over the plain one
-    const matches = templates
-        .filter(t => regex.test(path.basename(t)))
-        .sort((a, b) => b.length - a.length);
-
-    if (matches.length === 0) {
-        core.warning(`No matching template path found for ${template}`);
-        return undefined;
-    }
-
-    return path.normalize(matches[0]!);
+export function GetBundledTemplateId(templatePath: string): string {
+    return path.basename(templatePath).replace(/(?:-\d+\.\d+\.\d+[\w.-]*?)?\.(?:tgz|tar\.gz)$/, '');
 }
