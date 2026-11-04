@@ -54,4 +54,4 @@ steps:
 - Older editors create the project with the editor's `-createProject`, from a template bundled with the editor that matches `template-name`, or without a template when none does.
 - v3 regex patterns are no longer supported, but v3 values keep working: a top-level `|` separates entries like a comma, and an entry such as `com.unity.template.3d(-cross-platform)?` is matched by its leading id, `com.unity.template.3d`, with a warning.
 - When creation fails for a reason a rerun can fix, the action adds a notice titled `unity-license-exhausted` or `unity-transient-failure` for [retry-failed-jobs](https://github.com/buildalon/retry-failed-jobs).
-- CI tests pull requests against the Unity streams the official Unity CLI lists, and a monthly run covers the older editor lines. Every Unity row reports as its own check, and rows on a stream with no final release yet (alpha or beta) report without failing the run.
+- CI tests pull requests against the Unity streams the official Unity CLI lists, and a monthly run covers the older editor lines.
